@@ -1,0 +1,1423 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AWS Databricks Migration Discovery Notebook Preview</title>
+<style>
+:root {
+  --bg: #f7f8fb;
+  --panel: #ffffff;
+  --ink: #172033;
+  --muted: #647084;
+  --line: #dce2ea;
+  --accent: #087c78;
+  --accent-2: #c94f2d;
+  --code-bg: #101827;
+  --code-ink: #e7eefc;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.55;
+}
+a { color: inherit; }
+.layout {
+  display: grid;
+  grid-template-columns: minmax(220px, 290px) minmax(0, 1fr);
+  min-height: 100vh;
+}
+aside {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow: auto;
+  border-right: 1px solid var(--line);
+  background: #ffffff;
+  padding: 28px 22px;
+}
+aside h2 { margin: 0 0 16px; font-size: 16px; }
+.toc { display: grid; gap: 8px; }
+.toc a {
+  text-decoration: none;
+  color: var(--muted);
+  font-size: 13px;
+  border-left: 2px solid transparent;
+  padding-left: 10px;
+}
+.toc a:hover { color: var(--accent); border-left-color: var(--accent); }
+.toc-level-1 { font-weight: 700; color: var(--ink) !important; margin-top: 8px; }
+.toc-level-2 { margin-left: 8px; }
+.toc-level-3 { margin-left: 18px; }
+main { padding: 38px min(5vw, 64px) 80px; max-width: 1180px; }
+.hero {
+  margin-bottom: 26px;
+  padding-bottom: 24px;
+  border-bottom: 1px solid var(--line);
+}
+.hero h1 { margin: 0 0 8px; font-size: clamp(30px, 4vw, 48px); line-height: 1.05; }
+.hero p { margin: 0; color: var(--muted); max-width: 760px; }
+.badges { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
+.badge {
+  border: 1px solid var(--line);
+  background: #fff;
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 12px;
+  padding: 5px 10px;
+}
+.cell {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  margin: 18px 0;
+  box-shadow: 0 10px 30px rgba(22, 32, 51, 0.05);
+}
+.markdown-cell { padding: 24px 28px; }
+.cell-kicker {
+  color: var(--accent-2);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  margin-bottom: 10px;
+}
+h1, h2, h3, h4 { line-height: 1.2; }
+.markdown-cell h1 { font-size: 28px; margin: 0 0 12px; }
+.markdown-cell h2 { font-size: 22px; margin: 0 0 12px; }
+.markdown-cell h3 { font-size: 18px; margin: 0 0 10px; }
+p { margin: 10px 0; }
+ul, ol { margin: 10px 0 10px 22px; padding: 0; }
+li { margin: 5px 0; }
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: .92em;
+}
+p code, li code { background: #eef3f6; border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; }
+details { padding: 0; }
+summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 14px 18px;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 12px;
+  border-bottom: 1px solid var(--line);
+}
+summary::-webkit-details-marker { display: none; }
+summary span { color: var(--accent-2); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
+summary strong { font-size: 14px; }
+summary em { color: var(--muted); font-size: 12px; font-style: normal; }
+pre {
+  margin: 0;
+  padding: 20px;
+  overflow: auto;
+  background: var(--code-bg);
+  color: var(--code-ink);
+  border-radius: 0 0 8px 8px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+@media (max-width: 860px) {
+  .layout { display: block; }
+  aside { position: relative; height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+  main { padding: 28px 18px 60px; }
+  summary { grid-template-columns: 1fr; align-items: start; }
+}
+</style>
+</head>
+<body>
+<div class="layout">
+<aside>
+  <h2>Notebook Sections</h2>
+  <nav class="toc"><a class="toc-level-1" href="#aws-databricks-migration-discovery-notebook">AWS Databricks Migration Discovery Notebook</a><a class="toc-level-2" href="#1-setup">1. Setup</a><a class="toc-level-2" href="#2-workspace-credentials-and-display-helpers">2. Workspace credentials and display helpers</a><a class="toc-level-2" href="#3-rest-api-helpers-with-retries-and-pagination">3. REST API helpers with retries and pagination</a><a class="toc-level-1" href="#api-inventory">API Inventory</a><a class="toc-level-2" href="#4-workspace-compute-inventory">4. Workspace compute inventory</a><a class="toc-level-2" href="#5-jobs-inventory-with-paginated-job-details">5. Jobs inventory with paginated job details</a><a class="toc-level-2" href="#6-current-notebook-cluster-executor-details">6. Current notebook cluster executor details</a><a class="toc-level-1" href="#azure-migration-sizing-outputs-from-api-inventory">Azure Migration Sizing Outputs From API Inventory</a><a class="toc-level-2" href="#7-azure-compute-and-sql-warehouse-sizing-tables">7. Azure compute and SQL warehouse sizing tables</a><a class="toc-level-1" href="#billing-usage-and-databricks-pricing">Billing Usage And Databricks Pricing</a><a class="toc-level-2" href="#8-sql-helpers-for-system-tables">8. SQL helpers for system tables</a><a class="toc-level-2" href="#9-usage-summaries-from-system-billing-usage">9. Usage summaries from system.billing.usage</a><a class="toc-level-2" href="#10-databricks-pricing-snapshots-and-aws-to-azure-list-price-estimate">10. Databricks pricing snapshots and AWS-to-Azure list-price estimate</a><a class="toc-level-1" href="#output-persistence">Output Persistence</a><a class="toc-level-2" href="#11-save-api-inventory-sizing-outputs-and-billing-outputs-separately">11. Save API inventory, sizing outputs, and billing outputs separately</a><a class="toc-level-2" href="#12-azure-migration-interpretation-checklist">12. Azure migration interpretation checklist</a></nav>
+</aside>
+<main>
+  <header class="hero">
+    <h1>AWS Databricks Migration Discovery</h1>
+    <p>Rendered preview of <code>aws_databricks_migration_discovery.ipynb</code>. This view is for reading and review; run the notebook itself in Databricks for live outputs.</p>
+    <div class="badges"><span class="badge">30 cells</span><span class="badge">AWS source workspace</span><span class="badge">Azure migration sizing</span><span class="badge">API + billing inventory</span></div>
+  </header>
+  <section class="cell markdown-cell"><div class="cell-kicker">Cell 1 · Markdown</div><h1 id="aws-databricks-migration-discovery-notebook">AWS Databricks Migration Discovery Notebook</h1>
+<p>Purpose: inventory an existing <strong>AWS Databricks</strong> workspace and collect the Databricks usage/pricing evidence needed to size a move to <strong>Azure Databricks</strong>.</p>
+<p>This notebook separates the work into three outputs:</p>
+<ul>
+<li><strong>API inventory</strong>: clusters, SQL warehouses, instance pools, node types, jobs, task clusters, and API collection errors.</li>
+<li><strong>Billing and pricing</strong>: <code>system.billing.usage</code>, <code>system.billing.list_prices</code>, current AWS/Azure price catalog snapshots, and Databricks list-price estimates.</li>
+<li><strong>Azure migration sizing</strong>: compute and SQL warehouse sizing tables designed for an Azure migration workbook.</li>
+</ul>
+<p>Run options:</p>
+<ul>
+<li>Inside the source AWS Databricks workspace.</li>
+<li>From VS Code using a Databricks-backed notebook/kernel.</li>
+<li>From VS Code or a local shell for REST API inventory only, with <code>DATABRICKS_HOST</code> and <code>DATABRICKS_TOKEN</code> set.</li>
+</ul>
+<p>Pricing note: Databricks list-price tables cover Databricks usage units such as DBUs. They do not replace AWS EC2/S3/EBS/network or Azure VM/ADLS/network pricing models.</p></section><section class="cell markdown-cell"><div class="cell-kicker">Cell 2 · Markdown</div><h2 id="1-setup">1. Setup</h2></section><section class="cell code-cell"><details open><summary><span>Cell 3 · Code</span><strong>Code</strong><em>71 lines</em></summary><pre><code>import configparser
+import json
+import os
+import random
+import time
+from datetime import date, timedelta
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import pandas as pd
+import requests
+
+try:
+    spark  # type: ignore[name-defined]
+except NameError:
+    try:
+        from pyspark.sql import SparkSession
+
+        spark = SparkSession.builder.getOrCreate()
+    except Exception:
+        spark = None
+
+HAS_SPARK = spark is not None
+
+if HAS_SPARK:
+    try:
+        from pyspark.sql.types import StringType, StructField, StructType
+    except Exception:
+        StringType = StructField = StructType = None
+else:
+    StringType = StructField = StructType = None
+
+
+def env_bool(name: str, default: bool = True) -&gt; bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {&quot;1&quot;, &quot;true&quot;, &quot;yes&quot;, &quot;y&quot;, &quot;on&quot;}
+
+
+def env_int(name: str, default: int) -&gt; int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        print(f&quot;Ignoring invalid integer for {name}: {value!r}&quot;)
+        return default
+
+
+CONFIG = {
+    &quot;source_cloud&quot;: os.getenv(&quot;SOURCE_CLOUD&quot;, &quot;AWS&quot;).upper(),
+    &quot;target_cloud&quot;: os.getenv(&quot;TARGET_CLOUD&quot;, &quot;AZURE&quot;).upper(),
+    &quot;usage_lookback_days&quot;: env_int(&quot;USAGE_LOOKBACK_DAYS&quot;, 90),
+    &quot;api_timeout_seconds&quot;: env_int(&quot;DATABRICKS_API_TIMEOUT_SECONDS&quot;, 30),
+    &quot;api_max_retries&quot;: env_int(&quot;DATABRICKS_API_MAX_RETRIES&quot;, 5),
+    &quot;api_backoff_seconds&quot;: float(os.getenv(&quot;DATABRICKS_API_BACKOFF_SECONDS&quot;, &quot;1.0&quot;)),
+    &quot;run_api_inventory&quot;: env_bool(&quot;RUN_API_INVENTORY&quot;, True),
+    &quot;run_billing_usage&quot;: env_bool(&quot;RUN_BILLING_USAGE&quot;, True),
+    &quot;output_base_path&quot;: os.getenv(&quot;OUTPUT_BASE_PATH&quot;, &quot;dbfs:/tmp/aws_databricks_migration_discovery&quot;),
+    &quot;local_output_dir&quot;: os.getenv(&quot;LOCAL_OUTPUT_DIR&quot;, &quot;./outputs/aws_databricks_migration_discovery&quot;),
+}
+
+start_date = (date.today() - timedelta(days=CONFIG[&quot;usage_lookback_days&quot;])).isoformat()
+
+print(&quot;Runtime summary&quot;)
+print(f&quot;- Spark available: {HAS_SPARK}&quot;)
+print(f&quot;- Source cloud: {CONFIG[&#x27;source_cloud&#x27;]}&quot;)
+print(f&quot;- Target cloud: {CONFIG[&#x27;target_cloud&#x27;]}&quot;)
+print(f&quot;- Usage lookback start date: {start_date}&quot;)</code></pre></details></section><section class="cell markdown-cell"><div class="cell-kicker">Cell 4 · Markdown</div><h2 id="2-workspace-credentials-and-display-helpers">2. Workspace credentials and display helpers</h2>
+<p>Credential precedence:</p>
+<ol>
+<li><code>DATABRICKS_HOST</code> / <code>DATABRICKS_TOKEN</code></li>
+<li><code>DATABRICKS_WORKSPACE_URL</code> / <code>DATABRICKS_TOKEN</code></li>
+<li><code>~/.databrickscfg</code> using <code>DATABRICKS_CONFIG_PROFILE</code>, defaulting to <code>DEFAULT</code></li>
+<li>Databricks notebook context, when running inside Databricks</li>
+</ol></section><section class="cell code-cell"><details open><summary><span>Cell 5 · Code</span><strong>Code</strong><em>173 lines</em></summary><pre><code>def normalize_workspace_url(value: Optional[str]) -&gt; Optional[str]:
+    if not value:
+        return None
+    value = value.strip().rstrip(&quot;/&quot;)
+    if not value:
+        return None
+    if not value.startswith((&quot;http://&quot;, &quot;https://&quot;)):
+        value = f&quot;https://{value}&quot;
+    return value
+
+
+def load_databricks_cfg() -&gt; Dict[str, str]:
+    cfg_path = Path(os.getenv(&quot;DATABRICKS_CONFIG_FILE&quot;, &quot;~/.databrickscfg&quot;)).expanduser()
+    profile = os.getenv(&quot;DATABRICKS_CONFIG_PROFILE&quot;, &quot;DEFAULT&quot;)
+    if not cfg_path.exists():
+        return {}
+
+    parser = configparser.ConfigParser()
+    parser.read(cfg_path)
+    if not parser.has_section(profile):
+        return {}
+
+    section = parser[profile]
+    return {
+        &quot;host&quot;: section.get(&quot;host&quot;, &quot;&quot;),
+        &quot;token&quot;: section.get(&quot;token&quot;, &quot;&quot;),
+    }
+
+
+def get_dbutils_if_available() -&gt; Optional[Any]:
+    if &quot;dbutils&quot; in globals():
+        return globals()[&quot;dbutils&quot;]
+    if not HAS_SPARK:
+        return None
+    try:
+        from pyspark.dbutils import DBUtils
+
+        return DBUtils(spark)
+    except Exception:
+        return None
+
+
+workspace_url = normalize_workspace_url(os.getenv(&quot;DATABRICKS_HOST&quot;) or os.getenv(&quot;DATABRICKS_WORKSPACE_URL&quot;))
+token = os.getenv(&quot;DATABRICKS_TOKEN&quot;)
+
+cfg = load_databricks_cfg()
+workspace_url = workspace_url or normalize_workspace_url(cfg.get(&quot;host&quot;))
+token = token or cfg.get(&quot;token&quot;)
+
+dbutils_obj = get_dbutils_if_available()
+if dbutils_obj is not None:
+    try:
+        ctx = dbutils_obj.notebook.entry_point.getDbutils().notebook().getContext()
+        workspace_url = workspace_url or normalize_workspace_url(ctx.browserHostName().get())
+        token = token or ctx.apiToken().get()
+    except Exception as exc:
+        print(f&quot;Databricks notebook context was not available: {str(exc)[:300]}&quot;)
+
+API_ENABLED = CONFIG[&quot;run_api_inventory&quot;] and bool(workspace_url and token)
+
+if workspace_url:
+    print(f&quot;Workspace URL: {workspace_url}&quot;)
+else:
+    print(&quot;Workspace URL not configured.&quot;)
+
+if not API_ENABLED:
+    print(&quot;REST API inventory is disabled or missing credentials. Set DATABRICKS_HOST and DATABRICKS_TOKEN to enable it.&quot;)
+
+
+def value_is_null(value: Any) -&gt; bool:
+    if value is None:
+        return True
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def normalize_cell_value(value: Any, force_string: bool = True) -&gt; Optional[str]:
+    if value_is_null(value):
+        return None
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, default=str, sort_keys=True)
+    if force_string:
+        return str(value)
+    return value
+
+
+def prepare_pdf_for_spark(pdf: pd.DataFrame, force_string: bool = True) -&gt; pd.DataFrame:
+    if pdf is None or pdf.empty:
+        return pd.DataFrame()
+    cleaned = pdf.copy()
+    cleaned.columns = [str(c) for c in cleaned.columns]
+    for col in cleaned.columns:
+        cleaned[col] = cleaned[col].map(lambda value: normalize_cell_value(value, force_string=force_string))
+    return cleaned
+
+
+def spark_df_from_pdf(pdf: pd.DataFrame, force_string: bool = True):
+    if not HAS_SPARK or pdf is None or pdf.empty:
+        return None
+
+    cleaned = prepare_pdf_for_spark(pdf, force_string=force_string)
+    if cleaned.empty:
+        return None
+
+    if force_string and StructType is not None:
+        schema = StructType([StructField(str(col), StringType(), True) for col in cleaned.columns])
+        rows = [tuple(row) for row in cleaned.itertuples(index=False, name=None)]
+        return spark.createDataFrame(rows, schema)
+
+    return spark.createDataFrame(cleaned)
+
+
+def empty_spark_df(message: str = &quot;No rows&quot;):
+    if not HAS_SPARK or StructType is None:
+        return None
+    return spark.createDataFrame([(message,)], [&quot;message&quot;])
+
+
+def display_spark_df(df, message: str = &quot;No rows&quot;) -&gt; None:
+    if df is None:
+        if HAS_SPARK:
+            df = empty_spark_df(message)
+        else:
+            print(message)
+            return
+
+    try:
+        display(df)  # type: ignore[name-defined]
+    except Exception:
+        if hasattr(df, &quot;show&quot;):
+            df.show(100, truncate=False)
+        else:
+            print(df)
+
+
+def display_pdf(pdf: pd.DataFrame, message: str = &quot;No rows&quot;, force_string: bool = True) -&gt; None:
+    if pdf is None or pdf.empty:
+        display_spark_df(None, message)
+        return
+    sdf = spark_df_from_pdf(pdf, force_string=force_string)
+    if sdf is not None:
+        display_spark_df(sdf, message)
+    else:
+        try:
+            display(pdf)  # type: ignore[name-defined]
+        except Exception:
+            print(pdf.to_string(index=False))
+
+
+def write_pdf_outputs(pdf_by_name: Dict[str, pd.DataFrame], output_path: str, local_dir: str) -&gt; None:
+    Path(local_dir).mkdir(parents=True, exist_ok=True)
+
+    for name, pdf in pdf_by_name.items():
+        if pdf is None or pdf.empty:
+            continue
+
+        local_file = Path(local_dir) / f&quot;{name}.csv&quot;
+        pdf.to_csv(local_file, index=False)
+
+        if HAS_SPARK:
+            sdf = spark_df_from_pdf(pdf, force_string=True)
+            if sdf is not None:
+                sdf.write.mode(&quot;overwrite&quot;).format(&quot;delta&quot;).save(f&quot;{output_path}/{name}&quot;)
+
+    print(f&quot;Local CSV outputs written under: {Path(local_dir).resolve()}&quot;)
+    if HAS_SPARK:
+        print(f&quot;Delta outputs written under: {output_path}&quot;)
+
+
+def sql_quote(value: str) -&gt; str:
+    return &quot;&#x27;&quot; + str(value).replace(&quot;&#x27;&quot;, &quot;&#x27;&#x27;&quot;) + &quot;&#x27;&quot;</code></pre></details></section><section class="cell markdown-cell"><div class="cell-kicker">Cell 6 · Markdown</div><h2 id="3-rest-api-helpers-with-retries-and-pagination">3. REST API helpers with retries and pagination</h2></section><section class="cell code-cell"><details open><summary><span>Cell 7 · Code</span><strong>Code</strong><em>167 lines</em></summary><pre><code>class DatabricksApiError(Exception):
+    def __init__(self, message: str, path: str, status_code: Optional[int] = None, response_text: str = &quot;&quot;):
+        super().__init__(message)
+        self.path = path
+        self.status_code = status_code
+        self.response_text = response_text[:2000]
+
+
+class DatabricksApiPermissionError(DatabricksApiError):
+    pass
+
+
+api_errors: List[Dict[str, Any]] = []
+session = requests.Session()
+
+
+def retry_delay_seconds(response: Optional[requests.Response], attempt: int) -&gt; float:
+    if response is not None:
+        retry_after = response.headers.get(&quot;Retry-After&quot;)
+        if retry_after:
+            try:
+                return min(float(retry_after), 60.0)
+            except ValueError:
+                pass
+
+    base = CONFIG[&quot;api_backoff_seconds&quot;] * (2 ** max(attempt - 1, 0))
+    jitter = random.uniform(0, CONFIG[&quot;api_backoff_seconds&quot;])
+    return min(base + jitter, 60.0)
+
+
+def api_request(method: str, path: str, params: Optional[Dict[str, Any]] = None, json_body: Optional[Dict[str, Any]] = None) -&gt; Dict[str, Any]:
+    if not API_ENABLED:
+        raise DatabricksApiError(&quot;REST API inventory is disabled or credentials are missing.&quot;, path)
+
+    url = f&quot;{workspace_url}{path}&quot;
+    headers = {
+        &quot;Authorization&quot;: f&quot;Bearer {token}&quot;,
+        &quot;Content-Type&quot;: &quot;application/json&quot;,
+    }
+    transient_status_codes = {429, 500, 502, 503, 504}
+    max_retries = max(CONFIG[&quot;api_max_retries&quot;], 1)
+
+    for attempt in range(1, max_retries + 1):
+        response = None
+        try:
+            response = session.request(
+                method=method.upper(),
+                url=url,
+                headers=headers,
+                params=params,
+                json=json_body,
+                timeout=CONFIG[&quot;api_timeout_seconds&quot;],
+            )
+
+            if response.status_code in transient_status_codes and attempt &lt; max_retries:
+                time.sleep(retry_delay_seconds(response, attempt))
+                continue
+
+            if response.status_code in {401, 403}:
+                raise DatabricksApiPermissionError(
+                    f&quot;{method.upper()} {path} failed with HTTP {response.status_code}. Check workspace permissions and token scope.&quot;,
+                    path=path,
+                    status_code=response.status_code,
+                    response_text=response.text,
+                )
+
+            if response.status_code &gt;= 400:
+                raise DatabricksApiError(
+                    f&quot;{method.upper()} {path} failed with HTTP {response.status_code}.&quot;,
+                    path=path,
+                    status_code=response.status_code,
+                    response_text=response.text,
+                )
+
+            if not response.text:
+                return {}
+            return response.json()
+
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            if attempt &gt;= max_retries:
+                raise DatabricksApiError(
+                    f&quot;{method.upper()} {path} failed after {max_retries} attempts: {exc}&quot;,
+                    path=path,
+                    response_text=str(exc),
+                )
+            time.sleep(retry_delay_seconds(response, attempt))
+
+    raise DatabricksApiError(f&quot;{method.upper()} {path} failed unexpectedly.&quot;, path=path)
+
+
+def api_get(path: str, params: Optional[Dict[str, Any]] = None) -&gt; Dict[str, Any]:
+    return api_request(&quot;GET&quot;, path, params=params)
+
+
+def record_api_error(source: str, path: str, exc: Exception) -&gt; None:
+    status_code = getattr(exc, &quot;status_code&quot;, None)
+    message = str(exc)
+    action = &quot;Review workspace permissions, token scope, endpoint availability, and admin settings.&quot;
+    if isinstance(exc, DatabricksApiPermissionError) or status_code in {401, 403}:
+        action = &quot;Grant the caller permission to view this resource or use a workspace/admin token with the required scope.&quot;
+
+    api_errors.append(
+        {
+            &quot;source&quot;: source,
+            &quot;path&quot;: path,
+            &quot;status_code&quot;: status_code,
+            &quot;message&quot;: message[:2000],
+            &quot;response_text&quot;: getattr(exc, &quot;response_text&quot;, &quot;&quot;)[:2000],
+            &quot;recommended_action&quot;: action,
+        }
+    )
+    print(f&quot;Skipped {source}: {message[:300]}&quot;)
+
+
+def paginated_get(
+    source: str,
+    path: str,
+    response_key: str,
+    params: Optional[Dict[str, Any]] = None,
+    limit_param: Optional[str] = None,
+    limit: Optional[int] = None,
+    token_param: str = &quot;page_token&quot;,
+    token_response_key: str = &quot;next_page_token&quot;,
+) -&gt; List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    page_token = None
+    seen_tokens = set()
+
+    while True:
+        page_params = dict(params or {})
+        if limit_param and limit:
+            page_params[limit_param] = limit
+        if page_token:
+            page_params[token_param] = page_token
+
+        response = api_get(path, params=page_params)
+        batch = response.get(response_key, []) or []
+        items.extend(batch)
+
+        next_token = response.get(token_response_key)
+        if not next_token:
+            break
+        if next_token in seen_tokens:
+            raise DatabricksApiError(f&quot;{source} pagination returned a repeated page token.&quot;, path=path)
+        seen_tokens.add(next_token)
+        page_token = next_token
+
+    return items
+
+
+def safe_paginated_get(source: str, path: str, response_key: str, **kwargs) -&gt; List[Dict[str, Any]]:
+    try:
+        return paginated_get(source, path, response_key, **kwargs)
+    except Exception as exc:
+        record_api_error(source, path, exc)
+        return []
+
+
+def safe_get(source: str, path: str, response_key: Optional[str] = None, params: Optional[Dict[str, Any]] = None) -&gt; Any:
+    try:
+        response = api_get(path, params=params)
+        if response_key:
+            return response.get(response_key, []) or []
+        return response
+    except Exception as exc:
+        record_api_error(source, path, exc)
+        return [] if response_key else {}</code></pre></details></section><section class="cell markdown-cell"><div class="cell-kicker">Cell 8 · Markdown</div><h1 id="api-inventory">API Inventory</h1></section><section class="cell markdown-cell"><div class="cell-kicker">Cell 9 · Markdown</div><h2 id="4-workspace-compute-inventory">4. Workspace compute inventory</h2></section><section class="cell code-cell"><details open><summary><span>Cell 10 · Code</span><strong>Code</strong><em>35 lines</em></summary><pre><code>clusters = safe_paginated_get(
+    &quot;clusters&quot;,
+    &quot;/api/2.0/clusters/list&quot;,
+    &quot;clusters&quot;,
+) if API_ENABLED else []
+
+warehouses = safe_paginated_get(
+    &quot;sql_warehouses&quot;,
+    &quot;/api/2.0/sql/warehouses&quot;,
+    &quot;warehouses&quot;,
+    limit_param=&quot;max_results&quot;,
+    limit=100,
+) if API_ENABLED else []
+
+instance_pools = safe_paginated_get(
+    &quot;instance_pools&quot;,
+    &quot;/api/2.0/instance-pools/list&quot;,
+    &quot;instance_pools&quot;,
+) if API_ENABLED else []
+
+node_types = safe_get(
+    &quot;node_types&quot;,
+    &quot;/api/2.0/clusters/list-node-types&quot;,
+    &quot;node_types&quot;,
+) if API_ENABLED else []
+
+clusters_df = pd.json_normalize(clusters)
+warehouses_df = pd.json_normalize(warehouses)
+pools_df = pd.json_normalize(instance_pools)
+node_types_df = pd.json_normalize(node_types)
+
+display_pdf(clusters_df, &quot;No clusters returned by the clusters/list API&quot;)
+display_pdf(warehouses_df, &quot;No SQL warehouses found&quot;)
+display_pdf(pools_df, &quot;No instance pools found&quot;)
+display_pdf(node_types_df, &quot;No node types returned&quot;)</code></pre></details></section><section class="cell code-cell"><details open><summary><span>Cell 11 · Code</span><strong>Code</strong><em>72 lines</em></summary><pre><code>cluster_cols = [
+    &quot;cluster_id&quot;,
+    &quot;cluster_name&quot;,
+    &quot;state&quot;,
+    &quot;cluster_source&quot;,
+    &quot;spark_version&quot;,
+    &quot;node_type_id&quot;,
+    &quot;driver_node_type_id&quot;,
+    &quot;num_workers&quot;,
+    &quot;autoscale.min_workers&quot;,
+    &quot;autoscale.max_workers&quot;,
+    &quot;autotermination_minutes&quot;,
+    &quot;enable_elastic_disk&quot;,
+    &quot;runtime_engine&quot;,
+    &quot;policy_id&quot;,
+    &quot;creator_user_name&quot;,
+]
+
+warehouse_cols = [
+    &quot;id&quot;,
+    &quot;name&quot;,
+    &quot;cluster_size&quot;,
+    &quot;min_num_clusters&quot;,
+    &quot;max_num_clusters&quot;,
+    &quot;auto_stop_mins&quot;,
+    &quot;enable_photon&quot;,
+    &quot;warehouse_type&quot;,
+    &quot;spot_instance_policy&quot;,
+    &quot;state&quot;,
+]
+
+pool_cols = [
+    &quot;instance_pool_id&quot;,
+    &quot;instance_pool_name&quot;,
+    &quot;node_type_id&quot;,
+    &quot;min_idle_instances&quot;,
+    &quot;max_capacity&quot;,
+    &quot;idle_instance_autotermination_minutes&quot;,
+    &quot;enable_elastic_disk&quot;,
+    &quot;aws_attributes.availability&quot;,
+    &quot;aws_attributes.zone_id&quot;,
+]
+
+node_type_cols = [
+    &quot;node_type_id&quot;,
+    &quot;memory_mb&quot;,
+    &quot;num_cores&quot;,
+    &quot;description&quot;,
+    &quot;instance_type_id&quot;,
+    &quot;category&quot;,
+    &quot;is_deprecated&quot;,
+    &quot;support_ebs_volumes&quot;,
+    &quot;node_info.available_core_quota&quot;,
+    &quot;node_info.total_core_quota&quot;,
+]
+
+
+def select_existing(pdf: pd.DataFrame, cols: List[str]) -&gt; pd.DataFrame:
+    if pdf is None or pdf.empty:
+        return pd.DataFrame()
+    return pdf[[col for col in cols if col in pdf.columns]]
+
+
+clusters_summary_pdf = select_existing(clusters_df, cluster_cols)
+warehouses_summary_pdf = select_existing(warehouses_df, warehouse_cols)
+pools_summary_pdf = select_existing(pools_df, pool_cols)
+node_types_summary_pdf = select_existing(node_types_df, node_type_cols)
+
+display_pdf(clusters_summary_pdf, &quot;No clusters to summarize&quot;)
+display_pdf(warehouses_summary_pdf, &quot;No warehouses to summarize&quot;)
+display_pdf(pools_summary_pdf, &quot;No instance pools to summarize&quot;)
+display_pdf(node_types_summary_pdf, &quot;No node types to summarize&quot;)</code></pre></details></section><section class="cell markdown-cell"><div class="cell-kicker">Cell 12 · Markdown</div><h2 id="5-jobs-inventory-with-paginated-job-details">5. Jobs inventory with paginated job details</h2></section><section class="cell code-cell"><details open><summary><span>Cell 13 · Code</span><strong>Code</strong><em>55 lines</em></summary><pre><code>job_summaries = safe_paginated_get(
+    &quot;jobs&quot;,
+    &quot;/api/2.1/jobs/list&quot;,
+    &quot;jobs&quot;,
+    limit_param=&quot;limit&quot;,
+    limit=100,
+) if API_ENABLED else []
+
+
+def merge_paginated_job_settings(base_job: Dict[str, Any], next_job: Dict[str, Any]) -&gt; Dict[str, Any]:
+    merged = dict(base_job)
+    merged_settings = dict(base_job.get(&quot;settings&quot;, {}) or {})
+    next_settings = next_job.get(&quot;settings&quot;, {}) or {}
+
+    for key, value in next_settings.items():
+        if key not in {&quot;tasks&quot;, &quot;job_clusters&quot;, &quot;parameters&quot;, &quot;environments&quot;}:
+            merged_settings.setdefault(key, value)
+
+    for array_key in [&quot;tasks&quot;, &quot;job_clusters&quot;, &quot;parameters&quot;, &quot;environments&quot;]:
+        existing = merged_settings.get(array_key) or []
+        merged_settings[array_key] = existing + (next_settings.get(array_key) or [])
+
+    merged[&quot;settings&quot;] = merged_settings
+    return merged
+
+
+def get_job_detail(job_summary: Dict[str, Any]) -&gt; Dict[str, Any]:
+    job_id = job_summary.get(&quot;job_id&quot;)
+    if not API_ENABLED or not job_id:
+        return job_summary
+
+    path = &quot;/api/2.1/jobs/get&quot;
+    try:
+        detail = api_get(path, params={&quot;job_id&quot;: job_id})
+        page_token = detail.get(&quot;next_page_token&quot;)
+        seen_tokens = set()
+
+        while page_token:
+            if page_token in seen_tokens:
+                raise DatabricksApiError(f&quot;Job {job_id} pagination returned a repeated page token.&quot;, path=path)
+            seen_tokens.add(page_token)
+            next_detail = api_get(path, params={&quot;job_id&quot;: job_id, &quot;page_token&quot;: page_token})
+            detail = merge_paginated_job_settings(detail, next_detail)
+            page_token = next_detail.get(&quot;next_page_token&quot;)
+
+        return detail
+    except Exception as exc:
+        record_api_error(f&quot;job_detail:{job_id}&quot;, path, exc)
+        return job_summary
+
+
+jobs = [get_job_detail(job) for job in job_summaries]
+jobs_df = pd.json_normalize(jobs)
+
+display_pdf(jobs_df, &quot;No jobs found&quot;)</code></pre></details></section><section class="cell code-cell"><details open><summary><span>Cell 14 · Code</span><strong>Code</strong><em>88 lines</em></summary><pre><code>job_cluster_rows: List[Dict[str, Any]] = []
+job_task_rows: List[Dict[str, Any]] = []
+
+for job in jobs:
+    job_id = job.get(&quot;job_id&quot;)
+    settings = job.get(&quot;settings&quot;, {}) or {}
+    job_name = settings.get(&quot;name&quot;)
+
+    for jc in settings.get(&quot;job_clusters&quot;, []) or []:
+        cluster_key = jc.get(&quot;job_cluster_key&quot;)
+        new_cluster = jc.get(&quot;new_cluster&quot;, {}) or {}
+        autoscale = new_cluster.get(&quot;autoscale&quot;) or {}
+        job_cluster_rows.append(
+            {
+                &quot;job_id&quot;: job_id,
+                &quot;job_name&quot;: job_name,
+                &quot;task_key&quot;: None,
+                &quot;cluster_key&quot;: cluster_key,
+                &quot;cluster_scope&quot;: &quot;job_cluster&quot;,
+                &quot;node_type_id&quot;: new_cluster.get(&quot;node_type_id&quot;),
+                &quot;driver_node_type_id&quot;: new_cluster.get(&quot;driver_node_type_id&quot;),
+                &quot;num_workers&quot;: new_cluster.get(&quot;num_workers&quot;),
+                &quot;autoscale_min_workers&quot;: autoscale.get(&quot;min_workers&quot;),
+                &quot;autoscale_max_workers&quot;: autoscale.get(&quot;max_workers&quot;),
+                &quot;spark_version&quot;: new_cluster.get(&quot;spark_version&quot;),
+                &quot;runtime_engine&quot;: new_cluster.get(&quot;runtime_engine&quot;),
+                &quot;policy_id&quot;: new_cluster.get(&quot;policy_id&quot;),
+                &quot;instance_pool_id&quot;: new_cluster.get(&quot;instance_pool_id&quot;),
+                &quot;driver_instance_pool_id&quot;: new_cluster.get(&quot;driver_instance_pool_id&quot;),
+            }
+        )
+
+    for task in settings.get(&quot;tasks&quot;, []) or []:
+        new_cluster = task.get(&quot;new_cluster&quot;) or {}
+        autoscale = new_cluster.get(&quot;autoscale&quot;) or {}
+        sql_task = task.get(&quot;sql_task&quot;) or {}
+        task_warehouse_id = sql_task.get(&quot;warehouse_id&quot;)
+
+        job_task_rows.append(
+            {
+                &quot;job_id&quot;: job_id,
+                &quot;job_name&quot;: job_name,
+                &quot;task_key&quot;: task.get(&quot;task_key&quot;),
+                &quot;existing_cluster_id&quot;: task.get(&quot;existing_cluster_id&quot;),
+                &quot;job_cluster_key&quot;: task.get(&quot;job_cluster_key&quot;),
+                &quot;sql_warehouse_id&quot;: task_warehouse_id,
+                &quot;has_new_cluster&quot;: bool(new_cluster),
+                &quot;node_type_id&quot;: new_cluster.get(&quot;node_type_id&quot;),
+                &quot;driver_node_type_id&quot;: new_cluster.get(&quot;driver_node_type_id&quot;),
+                &quot;num_workers&quot;: new_cluster.get(&quot;num_workers&quot;),
+                &quot;autoscale_min_workers&quot;: autoscale.get(&quot;min_workers&quot;),
+                &quot;autoscale_max_workers&quot;: autoscale.get(&quot;max_workers&quot;),
+                &quot;spark_version&quot;: new_cluster.get(&quot;spark_version&quot;),
+                &quot;runtime_engine&quot;: new_cluster.get(&quot;runtime_engine&quot;),
+                &quot;policy_id&quot;: new_cluster.get(&quot;policy_id&quot;),
+                &quot;instance_pool_id&quot;: new_cluster.get(&quot;instance_pool_id&quot;),
+                &quot;driver_instance_pool_id&quot;: new_cluster.get(&quot;driver_instance_pool_id&quot;),
+            }
+        )
+
+        if new_cluster:
+            job_cluster_rows.append(
+                {
+                    &quot;job_id&quot;: job_id,
+                    &quot;job_name&quot;: job_name,
+                    &quot;task_key&quot;: task.get(&quot;task_key&quot;),
+                    &quot;cluster_key&quot;: None,
+                    &quot;cluster_scope&quot;: &quot;task_new_cluster&quot;,
+                    &quot;node_type_id&quot;: new_cluster.get(&quot;node_type_id&quot;),
+                    &quot;driver_node_type_id&quot;: new_cluster.get(&quot;driver_node_type_id&quot;),
+                    &quot;num_workers&quot;: new_cluster.get(&quot;num_workers&quot;),
+                    &quot;autoscale_min_workers&quot;: autoscale.get(&quot;min_workers&quot;),
+                    &quot;autoscale_max_workers&quot;: autoscale.get(&quot;max_workers&quot;),
+                    &quot;spark_version&quot;: new_cluster.get(&quot;spark_version&quot;),
+                    &quot;runtime_engine&quot;: new_cluster.get(&quot;runtime_engine&quot;),
+                    &quot;policy_id&quot;: new_cluster.get(&quot;policy_id&quot;),
+                    &quot;instance_pool_id&quot;: new_cluster.get(&quot;instance_pool_id&quot;),
+                    &quot;driver_instance_pool_id&quot;: new_cluster.get(&quot;driver_instance_pool_id&quot;),
+                }
+            )
+
+job_clusters_pdf = pd.DataFrame(job_cluster_rows)
+job_tasks_pdf = pd.DataFrame(job_task_rows)
+api_errors_pdf = pd.DataFrame(api_errors)
+
+display_pdf(job_clusters_pdf, &quot;No job cluster definitions found&quot;)
+display_pdf(job_tasks_pdf, &quot;No job tasks found&quot;)
+display_pdf(api_errors_pdf, &quot;No REST API errors recorded&quot;)</code></pre></details></section><section class="cell markdown-cell"><div class="cell-kicker">Cell 15 · Markdown</div><h2 id="6-current-notebook-cluster-executor-details">6. Current notebook cluster executor details</h2>
+<p>This only describes the cluster running this notebook. Use it as a sanity check, not as a full migration inventory.</p></section><section class="cell code-cell"><details open><summary><span>Cell 16 · Code</span><strong>Code</strong><em>27 lines</em></summary><pre><code>executor_pdf = pd.DataFrame()
+spark_conf_pdf = pd.DataFrame()
+
+if HAS_SPARK:
+    try:
+        sc = spark.sparkContext
+        executor_infos = sc._jsc.sc().statusTracker().getExecutorInfos()
+        executor_rows = []
+        for executor in executor_infos:
+            executor_rows.append(
+                {
+                    &quot;executor_id&quot;: executor.executorId(),
+                    &quot;host&quot;: executor.host(),
+                    &quot;total_cores&quot;: executor.totalCores(),
+                    &quot;max_memory_bytes&quot;: executor.maxMemory(),
+                    &quot;max_memory_gb&quot;: round(executor.maxMemory() / (1024 ** 3), 2),
+                }
+            )
+        executor_pdf = pd.DataFrame(executor_rows)
+        spark_conf_pdf = pd.DataFrame(spark.sparkContext.getConf().getAll(), columns=[&quot;key&quot;, &quot;value&quot;])
+    except Exception as exc:
+        print(f&quot;Could not collect executor details: {str(exc)[:500]}&quot;)
+else:
+    print(&quot;Spark is not available, so executor details were skipped.&quot;)
+
+display_pdf(executor_pdf, &quot;No executor info returned&quot;)
+display_pdf(spark_conf_pdf, &quot;No Spark configuration returned&quot;)</code></pre></details></section><section class="cell markdown-cell"><div class="cell-kicker">Cell 17 · Markdown</div><h1 id="azure-migration-sizing-outputs-from-api-inventory">Azure Migration Sizing Outputs From API Inventory</h1></section><section class="cell markdown-cell"><div class="cell-kicker">Cell 18 · Markdown</div><h2 id="7-azure-compute-and-sql-warehouse-sizing-tables">7. Azure compute and SQL warehouse sizing tables</h2>
+<p>These tables are intentionally mapping-friendly. Fill <code>azure_*_candidate</code> columns during assessment after choosing the Azure region, VM family, availability model, and performance target.</p></section><section class="cell code-cell"><details open><summary><span>Cell 19 · Code</span><strong>Code</strong><em>165 lines</em></summary><pre><code>def int_or_none(value: Any) -&gt; Optional[int]:
+    if value_is_null(value):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_single_node_cluster(cluster: Dict[str, Any]) -&gt; bool:
+    spark_conf = cluster.get(&quot;spark_conf&quot;) or {}
+    if spark_conf.get(&quot;spark.databricks.cluster.profile&quot;) == &quot;singleNode&quot;:
+        return True
+    return int_or_none(cluster.get(&quot;num_workers&quot;)) == 0
+
+
+def worker_bounds(config: Dict[str, Any]) -&gt; Dict[str, Optional[int]]:
+    autoscale = config.get(&quot;autoscale&quot;) or {}
+    num_workers = int_or_none(config.get(&quot;num_workers&quot;))
+    min_workers = int_or_none(autoscale.get(&quot;min_workers&quot;))
+    max_workers = int_or_none(autoscale.get(&quot;max_workers&quot;))
+
+    if min_workers is None and num_workers is not None:
+        min_workers = num_workers
+    if max_workers is None and num_workers is not None:
+        max_workers = num_workers
+
+    return {
+        &quot;min_workers&quot;: min_workers,
+        &quot;max_workers&quot;: max_workers,
+    }
+
+
+def node_bounds(config: Dict[str, Any]) -&gt; Dict[str, Optional[int]]:
+    bounds = worker_bounds(config)
+    if is_single_node_cluster(config):
+        return {
+            &quot;min_nodes_including_driver&quot;: 1,
+            &quot;max_nodes_including_driver&quot;: 1,
+        }
+
+    min_workers = bounds[&quot;min_workers&quot;]
+    max_workers = bounds[&quot;max_workers&quot;]
+    return {
+        &quot;min_nodes_including_driver&quot;: min_workers + 1 if min_workers is not None else None,
+        &quot;max_nodes_including_driver&quot;: max_workers + 1 if max_workers is not None else None,
+    }
+
+
+def cluster_sizing_row(config: Dict[str, Any], source: str, item_id: Any, item_name: Any, extra: Optional[Dict[str, Any]] = None) -&gt; Dict[str, Any]:
+    bounds = worker_bounds(config)
+    nodes = node_bounds(config)
+    aws_attributes = config.get(&quot;aws_attributes&quot;) or {}
+    row = {
+        &quot;inventory_source&quot;: source,
+        &quot;source_cloud&quot;: CONFIG[&quot;source_cloud&quot;],
+        &quot;target_cloud&quot;: CONFIG[&quot;target_cloud&quot;],
+        &quot;item_id&quot;: item_id,
+        &quot;item_name&quot;: item_name,
+        &quot;aws_worker_node_type_id&quot;: config.get(&quot;node_type_id&quot;),
+        &quot;aws_driver_node_type_id&quot;: config.get(&quot;driver_node_type_id&quot;) or config.get(&quot;node_type_id&quot;),
+        &quot;min_workers&quot;: bounds[&quot;min_workers&quot;],
+        &quot;max_workers&quot;: bounds[&quot;max_workers&quot;],
+        &quot;min_nodes_including_driver&quot;: nodes[&quot;min_nodes_including_driver&quot;],
+        &quot;max_nodes_including_driver&quot;: nodes[&quot;max_nodes_including_driver&quot;],
+        &quot;spark_version&quot;: config.get(&quot;spark_version&quot;),
+        &quot;runtime_engine&quot;: config.get(&quot;runtime_engine&quot;),
+        &quot;policy_id&quot;: config.get(&quot;policy_id&quot;),
+        &quot;instance_pool_id&quot;: config.get(&quot;instance_pool_id&quot;),
+        &quot;driver_instance_pool_id&quot;: config.get(&quot;driver_instance_pool_id&quot;),
+        &quot;autotermination_minutes&quot;: config.get(&quot;autotermination_minutes&quot;),
+        &quot;enable_elastic_disk&quot;: config.get(&quot;enable_elastic_disk&quot;),
+        &quot;aws_availability&quot;: aws_attributes.get(&quot;availability&quot;),
+        &quot;aws_zone_id&quot;: aws_attributes.get(&quot;zone_id&quot;),
+        &quot;single_node&quot;: is_single_node_cluster(config),
+        &quot;azure_worker_vm_sku_candidate&quot;: None,
+        &quot;azure_driver_vm_sku_candidate&quot;: None,
+        &quot;azure_region_candidate&quot;: None,
+        &quot;azure_pricing_tier_candidate&quot;: None,
+        &quot;migration_notes&quot;: &quot;Map AWS node type to Azure VM SKU, then validate DBU SKU and cloud infrastructure cost separately.&quot;,
+    }
+    if extra:
+        row.update(extra)
+    return row
+
+
+cluster_sizing_rows = []
+for cluster in clusters:
+    cluster_sizing_rows.append(
+        cluster_sizing_row(
+            cluster,
+            source=&quot;interactive_or_recent_cluster&quot;,
+            item_id=cluster.get(&quot;cluster_id&quot;),
+            item_name=cluster.get(&quot;cluster_name&quot;),
+            extra={
+                &quot;cluster_state&quot;: cluster.get(&quot;state&quot;),
+                &quot;cluster_source&quot;: cluster.get(&quot;cluster_source&quot;),
+                &quot;creator_user_name&quot;: cluster.get(&quot;creator_user_name&quot;),
+            },
+        )
+    )
+
+job_cluster_sizing_rows = []
+for row in job_cluster_rows:
+    config = {
+        &quot;node_type_id&quot;: row.get(&quot;node_type_id&quot;),
+        &quot;driver_node_type_id&quot;: row.get(&quot;driver_node_type_id&quot;),
+        &quot;num_workers&quot;: row.get(&quot;num_workers&quot;),
+        &quot;autoscale&quot;: {
+            &quot;min_workers&quot;: row.get(&quot;autoscale_min_workers&quot;),
+            &quot;max_workers&quot;: row.get(&quot;autoscale_max_workers&quot;),
+        },
+        &quot;spark_version&quot;: row.get(&quot;spark_version&quot;),
+        &quot;runtime_engine&quot;: row.get(&quot;runtime_engine&quot;),
+        &quot;policy_id&quot;: row.get(&quot;policy_id&quot;),
+        &quot;instance_pool_id&quot;: row.get(&quot;instance_pool_id&quot;),
+        &quot;driver_instance_pool_id&quot;: row.get(&quot;driver_instance_pool_id&quot;),
+    }
+    job_cluster_sizing_rows.append(
+        cluster_sizing_row(
+            config,
+            source=row.get(&quot;cluster_scope&quot;, &quot;job_cluster&quot;),
+            item_id=row.get(&quot;job_id&quot;),
+            item_name=row.get(&quot;job_name&quot;),
+            extra={
+                &quot;task_key&quot;: row.get(&quot;task_key&quot;),
+                &quot;cluster_key&quot;: row.get(&quot;cluster_key&quot;),
+            },
+        )
+    )
+
+warehouse_sizing_rows = []
+for wh in warehouses:
+    warehouse_sizing_rows.append(
+        {
+            &quot;inventory_source&quot;: &quot;sql_warehouse&quot;,
+            &quot;source_cloud&quot;: CONFIG[&quot;source_cloud&quot;],
+            &quot;target_cloud&quot;: CONFIG[&quot;target_cloud&quot;],
+            &quot;warehouse_id&quot;: wh.get(&quot;id&quot;),
+            &quot;warehouse_name&quot;: wh.get(&quot;name&quot;),
+            &quot;warehouse_type&quot;: wh.get(&quot;warehouse_type&quot;),
+            &quot;cluster_size&quot;: wh.get(&quot;cluster_size&quot;),
+            &quot;min_num_clusters&quot;: wh.get(&quot;min_num_clusters&quot;),
+            &quot;max_num_clusters&quot;: wh.get(&quot;max_num_clusters&quot;),
+            &quot;auto_stop_mins&quot;: wh.get(&quot;auto_stop_mins&quot;),
+            &quot;enable_photon&quot;: wh.get(&quot;enable_photon&quot;),
+            &quot;spot_instance_policy&quot;: wh.get(&quot;spot_instance_policy&quot;),
+            &quot;state&quot;: wh.get(&quot;state&quot;),
+            &quot;azure_sql_warehouse_size_candidate&quot;: None,
+            &quot;azure_pricing_tier_candidate&quot;: None,
+            &quot;azure_region_candidate&quot;: None,
+            &quot;migration_notes&quot;: &quot;Validate SQL warehouse SKU, Photon, serverless/pro classic choice, and concurrency separately in Azure.&quot;,
+        }
+    )
+
+cluster_sizing_pdf = pd.DataFrame(cluster_sizing_rows)
+job_cluster_sizing_pdf = pd.DataFrame(job_cluster_sizing_rows)
+warehouse_sizing_pdf = pd.DataFrame(warehouse_sizing_rows)
+combined_compute_sizing_pdf = pd.concat(
+    [cluster_sizing_pdf, job_cluster_sizing_pdf],
+    ignore_index=True,
+) if cluster_sizing_rows or job_cluster_sizing_rows else pd.DataFrame()
+
+display_pdf(combined_compute_sizing_pdf, &quot;No compute sizing rows produced&quot;)
+display_pdf(warehouse_sizing_pdf, &quot;No SQL warehouse sizing rows produced&quot;)</code></pre></details></section><section class="cell markdown-cell"><div class="cell-kicker">Cell 20 · Markdown</div><h1 id="billing-usage-and-databricks-pricing">Billing Usage And Databricks Pricing</h1></section><section class="cell markdown-cell"><div class="cell-kicker">Cell 21 · Markdown</div><h2 id="8-sql-helpers-for-system-tables">8. SQL helpers for system tables</h2></section><section class="cell code-cell"><details open><summary><span>Cell 22 · Code</span><strong>Code</strong><em>58 lines</em></summary><pre><code>sql_errors: List[Dict[str, Any]] = []
+
+
+def record_sql_error(name: str, exc: Exception, recommended_action: str) -&gt; None:
+    sql_errors.append(
+        {
+            &quot;query_name&quot;: name,
+            &quot;message&quot;: str(exc)[:2000],
+            &quot;recommended_action&quot;: recommended_action,
+        }
+    )
+    print(f&quot;Skipped {name}: {str(exc)[:500]}&quot;)
+
+
+def safe_sql(name: str, query: str, recommended_action: str):
+    if not CONFIG[&quot;run_billing_usage&quot;]:
+        record_sql_error(name, Exception(&quot;Billing usage collection is disabled by RUN_BILLING_USAGE.&quot;), &quot;Set RUN_BILLING_USAGE=true to enable it.&quot;)
+        return None
+    if not HAS_SPARK:
+        record_sql_error(name, Exception(&quot;Spark is not available.&quot;), &quot;Run from Databricks or VS Code with a Databricks-backed Spark session.&quot;)
+        return None
+    try:
+        return spark.sql(query)
+    except Exception as exc:
+        record_sql_error(name, exc, recommended_action)
+        return None
+
+
+def describe_table_columns(table_name: str) -&gt; List[str]:
+    if not HAS_SPARK:
+        return []
+    try:
+        rows = spark.sql(f&quot;DESCRIBE TABLE {table_name}&quot;).collect()
+        return [row[&quot;col_name&quot;] for row in rows if row[&quot;col_name&quot;] and not row[&quot;col_name&quot;].startswith(&quot;#&quot;)]
+    except Exception as exc:
+        record_sql_error(
+            f&quot;describe_{table_name.replace(&#x27;.&#x27;, &#x27;_&#x27;)}&quot;,
+            exc,
+            &quot;Grant SELECT on the system table or ask an account admin to enable/access system tables.&quot;,
+        )
+        return []
+
+
+usage_cols = set(describe_table_columns(&quot;system.billing.usage&quot;)) if CONFIG[&quot;run_billing_usage&quot;] and HAS_SPARK else set()
+
+usage_metadata_expr = &quot;to_json(usage_metadata)&quot; if &quot;usage_metadata&quot; in usage_cols else &quot;CAST(NULL AS STRING)&quot;
+u_usage_metadata_expr = &quot;to_json(u.usage_metadata)&quot; if &quot;usage_metadata&quot; in usage_cols else &quot;CAST(NULL AS STRING)&quot;
+product_features_expr = &quot;to_json(product_features)&quot; if &quot;product_features&quot; in usage_cols else &quot;CAST(NULL AS STRING)&quot;
+identity_metadata_expr = &quot;to_json(identity_metadata)&quot; if &quot;identity_metadata&quot; in usage_cols else &quot;CAST(NULL AS STRING)&quot;
+billing_origin_product_expr = &quot;billing_origin_product&quot; if &quot;billing_origin_product&quot; in usage_cols else &quot;CAST(NULL AS STRING)&quot;
+u_billing_origin_product_expr = &quot;u.billing_origin_product&quot; if &quot;billing_origin_product&quot; in usage_cols else &quot;CAST(NULL AS STRING)&quot;
+usage_type_expr = &quot;usage_type&quot; if &quot;usage_type&quot; in usage_cols else &quot;CAST(NULL AS STRING)&quot;
+u_usage_type_expr = &quot;u.usage_type&quot; if &quot;usage_type&quot; in usage_cols else &quot;CAST(NULL AS STRING)&quot;
+
+billing_permission_action = (
+    &quot;Grant SELECT on system.billing.usage and system.billing.list_prices, or ask a Databricks account admin &quot;
+    &quot;to enable system tables and provide access.&quot;
+)</code></pre></details></section><section class="cell markdown-cell"><div class="cell-kicker">Cell 23 · Markdown</div><h2 id="9-usage-summaries-from-system-billing-usage">9. Usage summaries from <code>system.billing.usage</code></h2></section><section class="cell code-cell"><details open><summary><span>Cell 24 · Code</span><strong>Code</strong><em>156 lines</em></summary><pre><code>usage_detail = safe_sql(
+    &quot;billing_usage_detail&quot;,
+    f&quot;&quot;&quot;
+    SELECT
+      date_trunc(&#x27;month&#x27;, usage_start_time) AS usage_month,
+      workspace_id,
+      sku_name,
+      cloud,
+      usage_unit,
+      {usage_type_expr} AS usage_type,
+      {billing_origin_product_expr} AS billing_origin_product,
+      get_json_object({usage_metadata_expr}, &#x27;$.cluster_id&#x27;) AS cluster_id,
+      get_json_object({usage_metadata_expr}, &#x27;$.job_id&#x27;) AS job_id,
+      get_json_object({usage_metadata_expr}, &#x27;$.warehouse_id&#x27;) AS warehouse_id,
+      get_json_object({usage_metadata_expr}, &#x27;$.node_type&#x27;) AS node_type,
+      get_json_object({usage_metadata_expr}, &#x27;$.instance_pool_id&#x27;) AS instance_pool_id,
+      {product_features_expr} AS product_features_json,
+      {identity_metadata_expr} AS identity_metadata_json,
+      SUM(usage_quantity) AS total_usage_quantity,
+      MIN(usage_start_time) AS first_seen,
+      MAX(usage_end_time) AS last_seen
+    FROM system.billing.usage
+    WHERE usage_start_time &gt;= DATE({sql_quote(start_date)})
+    GROUP BY
+      date_trunc(&#x27;month&#x27;, usage_start_time),
+      workspace_id,
+      sku_name,
+      cloud,
+      usage_unit,
+      {usage_type_expr},
+      {billing_origin_product_expr},
+      get_json_object({usage_metadata_expr}, &#x27;$.cluster_id&#x27;),
+      get_json_object({usage_metadata_expr}, &#x27;$.job_id&#x27;),
+      get_json_object({usage_metadata_expr}, &#x27;$.warehouse_id&#x27;),
+      get_json_object({usage_metadata_expr}, &#x27;$.node_type&#x27;),
+      get_json_object({usage_metadata_expr}, &#x27;$.instance_pool_id&#x27;),
+      {product_features_expr},
+      {identity_metadata_expr}
+    ORDER BY usage_month DESC, total_usage_quantity DESC
+    &quot;&quot;&quot;,
+    billing_permission_action,
+)
+display_spark_df(usage_detail, &quot;No billing usage detail available&quot;)
+
+monthly_summary = safe_sql(
+    &quot;monthly_usage_summary&quot;,
+    f&quot;&quot;&quot;
+    SELECT
+      date_trunc(&#x27;month&#x27;, usage_start_time) AS usage_month,
+      sku_name,
+      cloud,
+      usage_unit,
+      {usage_type_expr} AS usage_type,
+      {billing_origin_product_expr} AS billing_origin_product,
+      SUM(usage_quantity) AS total_usage_quantity
+    FROM system.billing.usage
+    WHERE usage_start_time &gt;= DATE({sql_quote(start_date)})
+    GROUP BY
+      date_trunc(&#x27;month&#x27;, usage_start_time),
+      sku_name,
+      cloud,
+      usage_unit,
+      {usage_type_expr},
+      {billing_origin_product_expr}
+    ORDER BY usage_month DESC, total_usage_quantity DESC
+    &quot;&quot;&quot;,
+    billing_permission_action,
+)
+display_spark_df(monthly_summary, &quot;No monthly usage summary available&quot;)
+
+cluster_usage = safe_sql(
+    &quot;cluster_usage_summary&quot;,
+    f&quot;&quot;&quot;
+    SELECT
+      get_json_object({usage_metadata_expr}, &#x27;$.cluster_id&#x27;) AS cluster_id,
+      sku_name,
+      cloud,
+      usage_unit,
+      {usage_type_expr} AS usage_type,
+      {billing_origin_product_expr} AS billing_origin_product,
+      SUM(usage_quantity) AS total_usage_quantity,
+      MIN(usage_start_time) AS first_seen,
+      MAX(usage_end_time) AS last_seen
+    FROM system.billing.usage
+    WHERE usage_start_time &gt;= DATE({sql_quote(start_date)})
+      AND get_json_object({usage_metadata_expr}, &#x27;$.cluster_id&#x27;) IS NOT NULL
+    GROUP BY
+      get_json_object({usage_metadata_expr}, &#x27;$.cluster_id&#x27;),
+      sku_name,
+      cloud,
+      usage_unit,
+      {usage_type_expr},
+      {billing_origin_product_expr}
+    ORDER BY total_usage_quantity DESC
+    &quot;&quot;&quot;,
+    billing_permission_action,
+)
+display_spark_df(cluster_usage, &quot;No cluster usage summary available&quot;)
+
+job_usage = safe_sql(
+    &quot;job_usage_summary&quot;,
+    f&quot;&quot;&quot;
+    SELECT
+      get_json_object({usage_metadata_expr}, &#x27;$.job_id&#x27;) AS job_id,
+      sku_name,
+      cloud,
+      usage_unit,
+      {usage_type_expr} AS usage_type,
+      {billing_origin_product_expr} AS billing_origin_product,
+      SUM(usage_quantity) AS total_usage_quantity,
+      MIN(usage_start_time) AS first_seen,
+      MAX(usage_end_time) AS last_seen
+    FROM system.billing.usage
+    WHERE usage_start_time &gt;= DATE({sql_quote(start_date)})
+      AND get_json_object({usage_metadata_expr}, &#x27;$.job_id&#x27;) IS NOT NULL
+    GROUP BY
+      get_json_object({usage_metadata_expr}, &#x27;$.job_id&#x27;),
+      sku_name,
+      cloud,
+      usage_unit,
+      {usage_type_expr},
+      {billing_origin_product_expr}
+    ORDER BY total_usage_quantity DESC
+    &quot;&quot;&quot;,
+    billing_permission_action,
+)
+display_spark_df(job_usage, &quot;No job usage summary available&quot;)
+
+warehouse_usage = safe_sql(
+    &quot;warehouse_usage_summary&quot;,
+    f&quot;&quot;&quot;
+    SELECT
+      get_json_object({usage_metadata_expr}, &#x27;$.warehouse_id&#x27;) AS warehouse_id,
+      sku_name,
+      cloud,
+      usage_unit,
+      {usage_type_expr} AS usage_type,
+      {billing_origin_product_expr} AS billing_origin_product,
+      SUM(usage_quantity) AS total_usage_quantity,
+      MIN(usage_start_time) AS first_seen,
+      MAX(usage_end_time) AS last_seen
+    FROM system.billing.usage
+    WHERE usage_start_time &gt;= DATE({sql_quote(start_date)})
+      AND get_json_object({usage_metadata_expr}, &#x27;$.warehouse_id&#x27;) IS NOT NULL
+    GROUP BY
+      get_json_object({usage_metadata_expr}, &#x27;$.warehouse_id&#x27;),
+      sku_name,
+      cloud,
+      usage_unit,
+      {usage_type_expr},
+      {billing_origin_product_expr}
+    ORDER BY total_usage_quantity DESC
+    &quot;&quot;&quot;,
+    billing_permission_action,
+)
+display_spark_df(warehouse_usage, &quot;No SQL warehouse usage summary available&quot;)</code></pre></details></section><section class="cell markdown-cell"><div class="cell-kicker">Cell 25 · Markdown</div><h2 id="10-databricks-pricing-snapshots-and-aws-to-azure-list-price-estimate">10. Databricks pricing snapshots and AWS-to-Azure list-price estimate</h2>
+<p>These tables use <code>system.billing.list_prices</code> to keep prices current instead of copying static public pricing into the notebook.</p></section><section class="cell code-cell"><details open><summary><span>Cell 26 · Code</span><strong>Code</strong><em>122 lines</em></summary><pre><code>price_amount_expr = &quot;try_cast(coalesce(get_json_object(to_json(pricing), &#x27;$.effective_list.default&#x27;), get_json_object(to_json(pricing), &#x27;$.default&#x27;)) AS DOUBLE)&quot;
+source_cloud_sql = sql_quote(CONFIG[&quot;source_cloud&quot;])
+target_cloud_sql = sql_quote(CONFIG[&quot;target_cloud&quot;])
+
+price_catalog_history = safe_sql(
+    &quot;price_catalog_history_source_and_target&quot;,
+    f&quot;&quot;&quot;
+    SELECT
+      sku_name,
+      cloud,
+      currency_code,
+      usage_unit,
+      price_start_time,
+      price_end_time,
+      {price_amount_expr} AS list_unit_price,
+      to_json(pricing) AS pricing_json
+    FROM system.billing.list_prices
+    WHERE cloud IN ({source_cloud_sql}, {target_cloud_sql})
+    ORDER BY cloud, sku_name, usage_unit, price_start_time DESC
+    &quot;&quot;&quot;,
+    billing_permission_action,
+)
+display_spark_df(price_catalog_history, &quot;No pricing history available&quot;)
+
+current_price_catalog = safe_sql(
+    &quot;current_price_catalog_source_and_target&quot;,
+    f&quot;&quot;&quot;
+    SELECT
+      sku_name,
+      cloud,
+      currency_code,
+      usage_unit,
+      price_start_time,
+      price_end_time,
+      {price_amount_expr} AS list_unit_price,
+      to_json(pricing) AS pricing_json
+    FROM system.billing.list_prices
+    WHERE cloud IN ({source_cloud_sql}, {target_cloud_sql})
+      AND price_end_time IS NULL
+    ORDER BY cloud, sku_name, usage_unit
+    &quot;&quot;&quot;,
+    billing_permission_action,
+)
+display_spark_df(current_price_catalog, &quot;No current pricing catalog available&quot;)
+
+aws_to_azure_dbu_estimate = safe_sql(
+    &quot;source_to_target_databricks_list_price_estimate&quot;,
+    f&quot;&quot;&quot;
+    WITH priced_usage AS (
+      SELECT
+        date_trunc(&#x27;month&#x27;, u.usage_start_time) AS usage_month,
+        u.workspace_id,
+        u.sku_name,
+        u.cloud AS source_cloud,
+        u.usage_unit,
+        {u_usage_type_expr} AS usage_type,
+        {u_billing_origin_product_expr} AS billing_origin_product,
+        get_json_object({u_usage_metadata_expr}, &#x27;$.cluster_id&#x27;) AS cluster_id,
+        get_json_object({u_usage_metadata_expr}, &#x27;$.job_id&#x27;) AS job_id,
+        get_json_object({u_usage_metadata_expr}, &#x27;$.warehouse_id&#x27;) AS warehouse_id,
+        u.usage_quantity,
+        try_cast(coalesce(get_json_object(to_json(source_price.pricing), &#x27;$.effective_list.default&#x27;), get_json_object(to_json(source_price.pricing), &#x27;$.default&#x27;)) AS DOUBLE) AS source_list_unit_price,
+        source_price.currency_code AS source_currency_code,
+        try_cast(coalesce(get_json_object(to_json(target_price.pricing), &#x27;$.effective_list.default&#x27;), get_json_object(to_json(target_price.pricing), &#x27;$.default&#x27;)) AS DOUBLE) AS target_list_unit_price,
+        target_price.currency_code AS target_currency_code
+      FROM system.billing.usage u
+      LEFT JOIN system.billing.list_prices source_price
+        ON source_price.cloud = u.cloud
+       AND source_price.sku_name = u.sku_name
+       AND source_price.usage_unit = u.usage_unit
+       AND u.usage_start_time &gt;= source_price.price_start_time
+       AND (source_price.price_end_time IS NULL OR u.usage_start_time &lt; source_price.price_end_time)
+      LEFT JOIN system.billing.list_prices target_price
+        ON target_price.cloud = {target_cloud_sql}
+       AND target_price.sku_name = u.sku_name
+       AND target_price.usage_unit = u.usage_unit
+       AND u.usage_start_time &gt;= target_price.price_start_time
+       AND (target_price.price_end_time IS NULL OR u.usage_start_time &lt; target_price.price_end_time)
+      WHERE u.usage_start_time &gt;= DATE({sql_quote(start_date)})
+        AND u.cloud = {source_cloud_sql}
+    )
+    SELECT
+      usage_month,
+      workspace_id,
+      sku_name,
+      source_cloud,
+      {target_cloud_sql} AS target_cloud,
+      usage_unit,
+      usage_type,
+      billing_origin_product,
+      cluster_id,
+      job_id,
+      warehouse_id,
+      source_currency_code,
+      target_currency_code,
+      SUM(usage_quantity) AS total_usage_quantity,
+      SUM(usage_quantity * source_list_unit_price) AS source_databricks_list_cost,
+      SUM(usage_quantity * target_list_unit_price) AS target_databricks_list_cost,
+      SUM(usage_quantity * target_list_unit_price) - SUM(usage_quantity * source_list_unit_price) AS estimated_databricks_list_cost_delta,
+      SUM(CASE WHEN target_list_unit_price IS NULL THEN 1 ELSE 0 END) AS unpriced_usage_record_count
+    FROM priced_usage
+    GROUP BY
+      usage_month,
+      workspace_id,
+      sku_name,
+      source_cloud,
+      usage_unit,
+      usage_type,
+      billing_origin_product,
+      cluster_id,
+      job_id,
+      warehouse_id,
+      source_currency_code,
+      target_currency_code
+    ORDER BY usage_month DESC, target_databricks_list_cost DESC
+    &quot;&quot;&quot;,
+    billing_permission_action,
+)
+display_spark_df(aws_to_azure_dbu_estimate, &quot;No AWS-to-Azure Databricks list-price estimate available&quot;)
+
+sql_errors_pdf = pd.DataFrame(sql_errors)
+display_pdf(sql_errors_pdf, &quot;No billing SQL errors recorded&quot;)</code></pre></details></section><section class="cell markdown-cell"><div class="cell-kicker">Cell 27 · Markdown</div><h1 id="output-persistence">Output Persistence</h1></section><section class="cell markdown-cell"><div class="cell-kicker">Cell 28 · Markdown</div><h2 id="11-save-api-inventory-sizing-outputs-and-billing-outputs-separately">11. Save API inventory, sizing outputs, and billing outputs separately</h2></section><section class="cell code-cell"><details open><summary><span>Cell 29 · Code</span><strong>Code</strong><em>64 lines</em></summary><pre><code>output_base_path = CONFIG[&quot;output_base_path&quot;].rstrip(&quot;/&quot;)
+api_output_path = f&quot;{output_base_path}/api_inventory&quot;
+sizing_output_path = f&quot;{output_base_path}/azure_migration_sizing&quot;
+billing_output_path = f&quot;{output_base_path}/billing_usage_and_pricing&quot;
+
+local_output_dir = Path(CONFIG[&quot;local_output_dir&quot;])
+api_local_dir = str(local_output_dir / &quot;api_inventory&quot;)
+sizing_local_dir = str(local_output_dir / &quot;azure_migration_sizing&quot;)
+billing_local_dir = str(local_output_dir / &quot;billing_usage_and_pricing&quot;)
+
+api_outputs = {
+    &quot;clusters_raw&quot;: clusters_df,
+    &quot;clusters_summary&quot;: clusters_summary_pdf,
+    &quot;sql_warehouses_raw&quot;: warehouses_df,
+    &quot;sql_warehouses_summary&quot;: warehouses_summary_pdf,
+    &quot;instance_pools_raw&quot;: pools_df,
+    &quot;instance_pools_summary&quot;: pools_summary_pdf,
+    &quot;node_types_raw&quot;: node_types_df,
+    &quot;node_types_summary&quot;: node_types_summary_pdf,
+    &quot;jobs_raw&quot;: jobs_df,
+    &quot;job_clusters&quot;: job_clusters_pdf,
+    &quot;job_tasks&quot;: job_tasks_pdf,
+    &quot;api_errors&quot;: api_errors_pdf,
+    &quot;notebook_executors&quot;: executor_pdf,
+    &quot;notebook_spark_conf&quot;: spark_conf_pdf,
+}
+
+sizing_outputs = {
+    &quot;azure_compute_sizing_from_api&quot;: combined_compute_sizing_pdf,
+    &quot;azure_interactive_cluster_sizing_from_api&quot;: cluster_sizing_pdf,
+    &quot;azure_job_cluster_sizing_from_api&quot;: job_cluster_sizing_pdf,
+    &quot;azure_sql_warehouse_sizing_from_api&quot;: warehouse_sizing_pdf,
+    &quot;azure_node_type_reference_from_api&quot;: node_types_summary_pdf,
+}
+
+write_pdf_outputs(api_outputs, api_output_path, api_local_dir)
+write_pdf_outputs(sizing_outputs, sizing_output_path, sizing_local_dir)
+
+spark_outputs = {
+    &quot;billing_usage_detail&quot;: usage_detail,
+    &quot;monthly_usage_summary&quot;: monthly_summary,
+    &quot;cluster_usage_summary&quot;: cluster_usage,
+    &quot;job_usage_summary&quot;: job_usage,
+    &quot;warehouse_usage_summary&quot;: warehouse_usage,
+    &quot;price_catalog_history_source_and_target&quot;: price_catalog_history,
+    &quot;current_price_catalog_source_and_target&quot;: current_price_catalog,
+    &quot;source_to_target_databricks_list_price_estimate&quot;: aws_to_azure_dbu_estimate,
+}
+
+if HAS_SPARK:
+    for name, df in spark_outputs.items():
+        if df is not None:
+            df.write.mode(&quot;overwrite&quot;).format(&quot;delta&quot;).save(f&quot;{billing_output_path}/{name}&quot;)
+            df.coalesce(1).write.mode(&quot;overwrite&quot;).option(&quot;header&quot;, &quot;true&quot;).csv(f&quot;{billing_output_path}_csv/{name}&quot;)
+
+    if not sql_errors_pdf.empty:
+        sdf = spark_df_from_pdf(sql_errors_pdf, force_string=True)
+        if sdf is not None:
+            sdf.write.mode(&quot;overwrite&quot;).format(&quot;delta&quot;).save(f&quot;{billing_output_path}/billing_sql_errors&quot;)
+
+    print(f&quot;Billing Delta outputs written under: {billing_output_path}&quot;)
+    print(f&quot;Billing CSV outputs written under: {billing_output_path}_csv&quot;)
+else:
+    print(&quot;Spark is not available, so billing Delta/CSV outputs were skipped.&quot;)</code></pre></details></section><section class="cell markdown-cell"><div class="cell-kicker">Cell 30 · Markdown</div><h2 id="12-azure-migration-interpretation-checklist">12. Azure migration interpretation checklist</h2>
+<p>Use the outputs to build the Azure migration sizing model:</p>
+<ul>
+<li>Map AWS node types from <code>azure_node_type_reference_from_api</code> to Azure VM families and region availability.</li>
+<li>Use <code>azure_compute_sizing_from_api</code> for all-purpose, interactive, and job-cluster node counts.</li>
+<li>Use <code>azure_sql_warehouse_sizing_from_api</code> for SQL warehouse size, min/max cluster count, Photon, and stop policy.</li>
+<li>Use <code>source_to_target_databricks_list_price_estimate</code> for Databricks DBU/list-price comparison by SKU.</li>
+<li>Add Azure VM, disk, ADLS Gen2, network, Private Link, monitoring, and backup costs separately.</li>
+<li>Reconcile API inventory with billing usage because cluster APIs only show active or recently terminated clusters, while billing usage is historical.</li>
+<li>Treat rows with <code>unpriced_usage_record_count &gt; 0</code> as manual review items. SKU names can differ across clouds or service generations.</li>
+</ul></section>
+</main>
+</div>
+</body>
+</html>
