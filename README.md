@@ -22,8 +22,8 @@ The default target region is **`uaenorth`** (UAE North). Any other region is one
 No code editing, no Azure credentials, no Azure subscription and no secrets are required. Everything the
 customer can change is a widget.
 
-If the workspace has no outbound internet access, live Azure pricing is skipped, the notebook says so, and
-sizing still runs against a built-in region list.
+If the workspace has no outbound internet access the notebook says so clearly and still reports your full
+AWS inventory and consumption; the Azure sizing and pricing sections are skipped rather than guessed.
 
 ## What you get
 
@@ -90,17 +90,47 @@ southeastasia  australiaeast  japaneast  centralindia  qatarcentral  israelcentr
 ## How the Azure size is chosen
 
 1. AWS vCPU and memory come from the workspace's own `clusters/list-node-types` API where available,
-   otherwise they are derived from the instance name. The `aws_spec_source` column records which.
+   then from AWS's public pricing feed, and only as a last resort are they derived from the instance
+   name. The `aws_spec_source` column records which of the three was used.
 2. The VM family follows the memory-per-vCPU ratio — ≥ 7 GB → **E** series (memory optimized),
-   ≤ 2.5 GB → **F** series (compute optimized), otherwise **D** series (general purpose). AWS
-   storage-optimized nodes map to the **L** series to keep local NVMe; GPU nodes map to **NC/ND**.
+   ≤ 2.75 GB → **F** series (compute optimized), otherwise **D** series (general purpose). AWS
+   storage-optimized nodes map to the **L** series to keep local NVMe; GPU nodes map to GPU VMs.
 3. Within that family the notebook picks the smallest VM that meets or exceeds the AWS vCPU **and** memory.
 4. Node counts carry over unchanged, so the comparison is like for like.
 5. Every row carries a `mapping_confidence` (`high` / `medium` / `review` / `low`) and a plain-English
    `mapping_note` explaining the choice.
 
+The candidate list is the intersection of the live Azure size catalog and the live price list for your
+region, so the notebook can only ever recommend a VM that is **actually on sale, at a published price,
+where you are deploying**. Section 10 prints the full funnel showing how many sizes each rule removed.
+
 Set **B5 VM family preference** or **B6 Force a VM SKU** to override the automatic choice, or
 **C1 Sizing strategy** to `cost_optimized` (allows up to 20% less memory) or `performance` (one size up).
+
+## Nothing is hard-coded
+
+The notebook contains **no built-in table of instance specifications or prices**. Everything is fetched at
+run time from public, anonymous endpoints, so new VM sizes, price changes and new regions are picked up
+automatically with no code change:
+
+| Data | Source |
+| --- | --- |
+| AWS instance vCPU / memory / NVMe | `clusters/list-node-types` on your workspace, then `b0.p.awsstatic.com` pricing feed |
+| Azure VM vCPU / memory / disk / GPU | `azure.microsoft.com/api/v3/pricing/virtual-machines/calculator` |
+| Azure VM workload family (D/E/F/L/GPU) | Microsoft's own classification in the same calculator API |
+| Azure VM prices, all six pricing models | `prices.azure.com/api/retail/prices` |
+| Valid `armRegionName` values | `prices.azure.com/api/retail/prices` |
+| Databricks DBU prices, AWS and Azure | `system.billing.list_prices` |
+
+The `reference_data_sources` output table records the endpoint, status, row count and UTC timestamp for
+every fetch in the run. The only date-stamped constant left in the notebook is the offline fallback list of
+region names, used solely when the pricing API is unreachable.
+
+Which VM families Azure Databricks supports is the one thing no public API publishes. By default the
+notebook applies a documented, printed policy (no burstable, confidential-compute, legacy A, SAP-certified
+or M-series sizes; 4–128 vCPU; no constrained-vCPU variants). If you already have an Azure Databricks
+workspace, set **E1** and **E2** and it will read the authoritative supported list from that workspace
+instead.
 
 ## Pricing
 
@@ -144,6 +174,13 @@ Benefit, storage, networking, and support. It is an estimate, not a quotation.
 | D1 Collect REST inventory | `RUN_API_INVENTORY` | `true` |
 | D2 Query system tables | `RUN_BILLING_USAGE` | `true` |
 | D3 Fetch live Azure prices | `RUN_AZURE_PRICING` | `true` |
+| E1 Azure DBX URL (optional) | `AZURE_DATABRICKS_WORKSPACE_URL` | empty |
+| E2 Azure DBX secret scope/key (optional) | `AZURE_DATABRICKS_TOKEN_SECRET` | empty |
+
+**E1** and **E2** are optional. Supply an existing Azure Databricks workspace URL and a read-only token
+reference (`scope/key` for `dbutils.secrets`, or the `AZURE_DATABRICKS_TOKEN` env var outside Databricks)
+and the notebook will read the authoritative list of supported VM sizes from it. Only the secret
+*reference* is ever stored or printed — never the token itself.
 
 Precedence is **widget → environment variable → constant in the settings cell**, so the same notebook works
 as a widget-driven demo in Databricks and as a scripted run in CI.
@@ -198,8 +235,9 @@ Delta tables under `OUTPUT_BASE_PATH` (default `dbfs:/tmp/aws_databricks_migrati
   `consumption_by_workload`, `consumption_by_instance_type`, `dbu_consumption_by_sku`,
   `azure_compute_sizing_from_api`, `azure_interactive_cluster_sizing_from_api`,
   `azure_job_cluster_sizing_from_api`, `azure_sql_warehouse_sizing_from_api`, `azure_vm_catalog`,
-  `azure_vm_prices`, `azure_pricing_warnings`, `azure_regions_allowed`, `quick_estimate`,
-  `quick_pricing_options`, `azure_region_comparison`, `aws_to_azure_mapping_examples`.
+  `azure_vm_catalog_funnel`, `reference_data_sources`, `azure_vm_prices`, `azure_pricing_warnings`,
+  `azure_regions_allowed`, `quick_estimate`, `quick_pricing_options`, `azure_region_comparison`,
+  `aws_to_azure_mapping_examples`.
 - `billing_usage_and_pricing/` — usage detail and summaries, DBU consumption by SKU, price catalogs, and the
   AWS→Azure Databricks list-price estimate.
 

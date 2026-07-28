@@ -60,11 +60,14 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import quote
 
 import pandas as pd
 import requests
 
-NOTEBOOK_VERSION = "2.0.0"
+NOTEBOOK_VERSION = "2.1.0"
+# Only the offline region fallback list carries a "verified on" date. Every hardware
+# specification and every price in this notebook is fetched live, so nothing else can go stale.
 REFERENCE_DATA_AS_OF = "2026-07"
 
 # Standard billing month used for every monthly figure in this notebook.
@@ -262,11 +265,13 @@ QUICK_CUSTOM_MEMORY_GB_PER_NODE = 64     # used only when WORKLOAD_SIZE = "custo
 
 #  AZURE_VM_FAMILY_PREFERENCE - constrain the recommended Azure VM family. Allowed values:
 #    auto                pick the family from the workload's memory-per-core ratio  (default)
-#    general_purpose     Dsv3 / Ddsv4 / Ddsv5 / Dadsv5     ~4 GB per vCPU
-#    memory_optimized    Esv3 / Edsv4 / Edsv5 / Eadsv5     ~8 GB per vCPU
-#    compute_optimized   Fsv2                              ~2 GB per vCPU
-#    storage_optimized   Lsv2 / Lsv3                       large local NVMe
-#    gpu                 NCasT4_v3 / NCads_A100_v4 / NDasr_v4
+#    general_purpose     ~4 GB per vCPU     D-series
+#    memory_optimized    ~8 GB per vCPU     E-series
+#    compute_optimized   ~2 GB per vCPU     F-series
+#    storage_optimized   large local NVMe   L-series
+#    gpu                 NC / ND series
+#  The exact sizes inside each family are discovered live from the Azure pricing APIs at run time,
+#  so this notebook always offers whatever Azure currently sells in your region.
 AZURE_VM_FAMILY_PREFERENCE = "auto"
 
 #  Force a specific Azure VM SKU and skip the recommendation engine, for example
@@ -304,6 +309,25 @@ USAGE_LOOKBACK_DAYS = 90          # billing and node-hour window, in days
 RUN_API_INVENTORY = True          # REST inventory of clusters, jobs, warehouses, pools
 RUN_BILLING_USAGE = True          # system.billing.* and system.compute.* queries
 RUN_AZURE_PRICING = True          # live call to https://prices.azure.com (needs outbound HTTPS)
+
+# ---------------------------------------------------------------------------------------------
+#  F. OPTIONAL - read the supported VM list from a real Azure Databricks workspace
+# ---------------------------------------------------------------------------------------------
+#  Leave both blank for the normal case. No public API publishes which Azure VM sizes Azure
+#  Databricks supports, so by default this notebook applies the eligibility policy printed in
+#  section 10 (minimum worker size, no burstable / confidential / legacy / SAP / HPC families).
+#
+#  If you already have ANY Azure Databricks workspace - even an empty sandbox - you can point the
+#  notebook at it and the supported list is read from that workspace's own API instead, which is
+#  the authoritative answer. Nothing is created or changed in that workspace; it is read only.
+#
+#  AZURE_DATABRICKS_WORKSPACE_URL  e.g. "https://adb-1234567890123456.7.azuredatabricks.net"
+#  AZURE_DATABRICKS_TOKEN_SECRET   a Databricks secret holding a PAT for that workspace, written
+#                                  as "scope/key", e.g. "migration/azure-dbx-token". The token is
+#                                  read with dbutils.secrets.get and is never printed or saved.
+#                                  Outside Databricks, set the AZURE_DATABRICKS_TOKEN env var.
+AZURE_DATABRICKS_WORKSPACE_URL = ""
+AZURE_DATABRICKS_TOKEN_SECRET = ""
 
 #  Where results are written. Delta goes to OUTPUT_BASE_PATH, CSV to LOCAL_OUTPUT_DIR.
 OUTPUT_BASE_PATH = "dbfs:/tmp/aws_databricks_migration_discovery"
@@ -425,6 +449,8 @@ WIDGET_SPECS: List[Tuple[str, str, str, List[str]]] = [
     ("run_api_inventory", "D1 Collect REST inventory", str(RUN_API_INVENTORY).lower(), ["true", "false"]),
     ("run_billing_usage", "D2 Query system tables", str(RUN_BILLING_USAGE).lower(), ["true", "false"]),
     ("run_azure_pricing", "D3 Fetch live Azure prices", str(RUN_AZURE_PRICING).lower(), ["true", "false"]),
+    ("azure_databricks_workspace_url", "E1 Azure DBX URL (optional)", AZURE_DATABRICKS_WORKSPACE_URL, []),
+    ("azure_databricks_token_secret", "E2 Azure DBX secret scope/key (optional)", AZURE_DATABRICKS_TOKEN_SECRET, []),
 ]
 
 # Environment variable that seeds each widget, so env vars still work for headless job runs.
@@ -446,6 +472,8 @@ WIDGET_ENV_VARS: Dict[str, str] = {
     "run_api_inventory": "RUN_API_INVENTORY",
     "run_billing_usage": "RUN_BILLING_USAGE",
     "run_azure_pricing": "RUN_AZURE_PRICING",
+    "azure_databricks_workspace_url": "AZURE_DATABRICKS_WORKSPACE_URL",
+    "azure_databricks_token_secret": "AZURE_DATABRICKS_TOKEN_SECRET",
 }
 
 WIDGETS_AVAILABLE = False
@@ -836,6 +864,14 @@ CONFIG: Dict[str, Any] = {
     "run_api_inventory": as_bool(resolve_setting("run_api_inventory", RUN_API_INVENTORY), RUN_API_INVENTORY),
     "run_billing_usage": as_bool(resolve_setting("run_billing_usage", RUN_BILLING_USAGE), RUN_BILLING_USAGE),
     "run_azure_pricing": as_bool(resolve_setting("run_azure_pricing", RUN_AZURE_PRICING), RUN_AZURE_PRICING),
+    # Optional, read-only. Used only to read the authoritative supported-VM list from a real Azure
+    # Databricks workspace. The secret reference is stored, never the token itself.
+    "azure_databricks_workspace_url": (
+        resolve_setting("azure_databricks_workspace_url", AZURE_DATABRICKS_WORKSPACE_URL) or ""
+    ).strip().rstrip("/"),
+    "azure_databricks_token_secret": (
+        resolve_setting("azure_databricks_token_secret", AZURE_DATABRICKS_TOKEN_SECRET) or ""
+    ).strip(),
     "api_timeout_seconds": env_int("DATABRICKS_API_TIMEOUT_SECONDS", 30),
     "api_max_retries": env_int("DATABRICKS_API_MAX_RETRIES", 5),
     "api_backoff_seconds": env_float("DATABRICKS_API_BACKOFF_SECONDS", 1.0),
@@ -1567,155 +1603,250 @@ display_pdf(spark_conf_pdf, "No Spark configuration returned")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 10. Hardware reference: AWS instance specs and the Azure VM catalog
+# MAGIC ## 10. Hardware reference: live AWS and Azure VM specifications
 # MAGIC
-# MAGIC **How AWS specs are resolved**, best source first:
+# MAGIC **Nothing in this section is hard-coded.** Every vCPU count, memory figure, disk size, VM family and
+# MAGIC price is read from a live API each time the notebook runs, so the estimate cannot drift as the clouds
+# MAGIC add sizes, retire families or change prices.
 # MAGIC
-# MAGIC 1. **This workspace's own `list-node-types` API** &mdash; the real vCPU, memory, GPU and local-disk figures
-# MAGIC    Databricks reports for every instance type it can launch here. This is the authoritative source.
-# MAGIC 2. **Derived from the instance name** &mdash; AWS size names are perfectly regular
-# MAGIC    (`large` = 2 vCPU, `xlarge` = 4, `N` + `xlarge` = 4&times;N), and each family has a fixed memory-per-vCPU
-# MAGIC    ratio. Used for node types seen in billing history that the API no longer lists.
-# MAGIC 3. **Unknown** &mdash; flagged in the output, never silently guessed.
+# MAGIC | What is looked up | Where it comes from | Credentials |
+# MAGIC | --- | --- | --- |
+# MAGIC | AWS vCPU, memory, GPUs, local NVMe | This workspace's own `clusters/list-node-types` API | Already in the notebook context |
+# MAGIC | AWS specs for instance types this workspace cannot launch | AWS public pricing metadata | None |
+# MAGIC | Azure vCPU, memory, temp disk, GPU model, family class | Azure public pricing calculator API | None |
+# MAGIC | Which Azure sizes can actually be bought in your region | Azure Retail Prices API | None |
+# MAGIC | Which Azure sizes Azure Databricks supports *(optional)* | An Azure Databricks workspace you nominate | Optional read-only token |
 # MAGIC
-# MAGIC Every sizing row carries `aws_spec_source` so you can see which of the three was used.
+# MAGIC Every lookup is recorded in the **provenance table** printed at the end of this section, with the exact
+# MAGIC endpoint and the time it was read. If a source is unreachable the notebook says so plainly and carries
+# MAGIC on with what it has &mdash; it never quietly substitutes stale built-in numbers.
 
 # COMMAND ----------
 
-# AWS size token -> vCPU. AWS naming is regular: "Nxlarge" is always N * 4 vCPU.
-AWS_SIZE_VCPU: Dict[str, int] = {
-    "nano": 1, "micro": 1, "small": 1, "medium": 1, "large": 2, "xlarge": 4,
-    **{f"{n}xlarge": n * 4 for n in (2, 3, 4, 6, 8, 9, 10, 12, 16, 18, 24, 32, 48, 56, 112)},
-}
+# =============================================================================================
+#  Public reference-data endpoints. All anonymous: no account, key, subscription or SDK.
+# =============================================================================================
 
-# AWS family prefix -> (memory GiB per vCPU, workload category, ships local NVMe).
-# The "d" and "i" families have local NVMe, which is what Databricks uses for shuffle and disk cache.
-AWS_FAMILY_SPECS: Dict[str, Tuple[float, str, bool]] = {
-    "t2": (2.0, "general_purpose", False),
-    "t3": (4.0, "general_purpose", False),
-    "t3a": (4.0, "general_purpose", False),
-    "m4": (4.0, "general_purpose", False),
-    "m5": (4.0, "general_purpose", False),
-    "m5a": (4.0, "general_purpose", False),
-    "m5ad": (4.0, "general_purpose", True),
-    "m5d": (4.0, "general_purpose", True),
-    "m5dn": (4.0, "general_purpose", True),
-    "m5n": (4.0, "general_purpose", False),
-    "m6a": (4.0, "general_purpose", False),
-    "m6g": (4.0, "general_purpose", False),
-    "m6gd": (4.0, "general_purpose", True),
-    "m6i": (4.0, "general_purpose", False),
-    "m6id": (4.0, "general_purpose", True),
-    "m7a": (4.0, "general_purpose", False),
-    "m7g": (4.0, "general_purpose", False),
-    "m7gd": (4.0, "general_purpose", True),
-    "m7i": (4.0, "general_purpose", False),
-    "m7id": (4.0, "general_purpose", True),
-    "c4": (2.0, "compute_optimized", False),
-    "c5": (2.0, "compute_optimized", False),
-    "c5a": (2.0, "compute_optimized", False),
-    "c5ad": (2.0, "compute_optimized", True),
-    "c5d": (2.0, "compute_optimized", True),
-    "c5n": (2.625, "compute_optimized", False),
-    "c6a": (2.0, "compute_optimized", False),
-    "c6g": (2.0, "compute_optimized", False),
-    "c6gd": (2.0, "compute_optimized", True),
-    "c6i": (2.0, "compute_optimized", False),
-    "c6id": (2.0, "compute_optimized", True),
-    "c7a": (2.0, "compute_optimized", False),
-    "c7g": (2.0, "compute_optimized", False),
-    "c7gd": (2.0, "compute_optimized", True),
-    "c7i": (2.0, "compute_optimized", False),
-    "r4": (7.625, "memory_optimized", False),
-    "r5": (8.0, "memory_optimized", False),
-    "r5a": (8.0, "memory_optimized", False),
-    "r5ad": (8.0, "memory_optimized", True),
-    "r5d": (8.0, "memory_optimized", True),
-    "r5dn": (8.0, "memory_optimized", True),
-    "r5n": (8.0, "memory_optimized", False),
-    "r6a": (8.0, "memory_optimized", False),
-    "r6g": (8.0, "memory_optimized", False),
-    "r6gd": (8.0, "memory_optimized", True),
-    "r6i": (8.0, "memory_optimized", False),
-    "r6id": (8.0, "memory_optimized", True),
-    "r7a": (8.0, "memory_optimized", False),
-    "r7g": (8.0, "memory_optimized", False),
-    "r7gd": (8.0, "memory_optimized", True),
-    "r7i": (8.0, "memory_optimized", False),
-    "r7iz": (8.0, "memory_optimized", False),
-    "x1": (15.25, "memory_optimized", True),
-    "x1e": (30.5, "memory_optimized", True),
-    "x2gd": (16.0, "memory_optimized", True),
-    "x2idn": (16.0, "memory_optimized", True),
-    "x2iedn": (32.0, "memory_optimized", True),
-    "z1d": (8.0, "memory_optimized", True),
-    "i2": (30.5, "storage_optimized", True),
-    "i3": (7.625, "storage_optimized", True),
-    "i3en": (8.0, "storage_optimized", True),
-    "i4g": (8.0, "storage_optimized", True),
-    "i4i": (8.0, "storage_optimized", True),
-    "im4gn": (4.0, "storage_optimized", True),
-    "is4gen": (6.0, "storage_optimized", True),
-    "d2": (7.625, "storage_optimized", True),
-    "d3": (8.0, "storage_optimized", True),
-    "d3en": (6.0, "storage_optimized", True),
-    "h1": (8.0, "storage_optimized", True),
-    "g4dn": (4.0, "gpu", True),
-    "g5": (4.0, "gpu", True),
-    "g5g": (2.0, "gpu", True),
-    "g6": (4.0, "gpu", True),
-    "p2": (12.2, "gpu", False),
-    "p3": (7.625, "gpu", False),
-    "p3dn": (10.66, "gpu", True),
-    "p4d": (12.0, "gpu", True),
-    "p5": (16.0, "gpu", True),
-}
+# AWS publishes the hardware specification of every EC2 instance type alongside its public
+# on-demand price. The document is small (about 0.1 MB compressed) and needs no credentials.
+AWS_INSTANCE_SPEC_ENDPOINT = (
+    "https://b0.p.awsstatic.com/pricing/2.0/meteredUnitMaps/ec2/USD/current/"
+    "ec2-ondemand-without-sec-sel/{location}/Linux/index.json"
+)
+# Instance hardware is identical in every AWS region, so these are queried only to widen coverage
+# of very new families. The first location that responds is already enough for a complete answer.
+AWS_INSTANCE_SPEC_LOCATIONS = ["US East (N. Virginia)", "US West (Oregon)"]
 
-# GPUs per instance, for the AWS families where the count is not simply derivable.
-AWS_GPU_COUNTS: Dict[str, int] = {
-    "g4dn.12xlarge": 4, "g4dn.metal": 8, "g5.12xlarge": 4, "g5.24xlarge": 4, "g5.48xlarge": 8,
-    "g6.12xlarge": 4, "g6.24xlarge": 4, "g6.48xlarge": 8, "p2.8xlarge": 8, "p2.16xlarge": 16,
-    "p3.8xlarge": 4, "p3.16xlarge": 8, "p3dn.24xlarge": 8, "p4d.24xlarge": 8, "p5.48xlarge": 8,
-}
+# The Azure pricing calculator's own data feed. Carries the vCPU, memory, temp-disk and GPU of
+# every Azure VM size, plus Microsoft's own classification of each size into a workload family.
+AZURE_VM_SPEC_ENDPOINT = "https://azure.microsoft.com/api/v3/pricing/virtual-machines/calculator/"
+
+# Filled in as each lookup completes, then displayed so you can see exactly what was read and when.
+REFERENCE_DATA_SOURCES: List[Dict[str, Any]] = []
+
+reference_data_session = requests.Session()
+reference_data_session.headers.update(
+    {
+        "User-Agent": f"aws-databricks-migration-discovery/{NOTEBOOK_VERSION}",
+        "Accept": "application/json",
+    }
+)
 
 
-def parse_aws_instance_type(instance_type: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Derive vCPU, memory and category from an AWS instance name such as ``r5d.4xlarge``.
+def record_reference_source(name: str, endpoint: str, status: str, detail: str = "") -> None:
+    """Record where one piece of reference data came from, for the provenance table."""
+    REFERENCE_DATA_SOURCES.append(
+        {
+            "reference_data": name,
+            "endpoint": endpoint,
+            "status": status,
+            "detail": str(detail)[:300],
+            "retrieved_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+    )
 
-    Returns ``None`` when the name cannot be parsed. AWS naming is regular enough that this is a
-    reliable fallback for node types the workspace API no longer returns.
+
+def fetch_reference_json(
+    url: str,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: int = 90,
+    max_retries: int = 3,
+    label: str = "reference data",
+) -> Any:
+    """GET a public JSON reference document, retrying transient failures with backoff.
+
+    Raises ``RuntimeError`` naming the endpoint once every attempt has failed, so callers can
+    degrade gracefully instead of the notebook dying on a network blip.
     """
-    if not instance_type:
-        return None
-    name = str(instance_type).strip().lower()
-    # Databricks node_type_ids look like "r5d.4xlarge"; strip any trailing Databricks suffix.
-    match = re.match(r"^([a-z][a-z0-9\-]*?)\.([a-z0-9]+)", name)
+    transient_status = {408, 425, 429, 500, 502, 503, 504}
+    last_error: Optional[Exception] = None
+
+    for attempt in range(1, max(max_retries, 1) + 1):
+        try:
+            response = reference_data_session.get(url, params=params, timeout=timeout)
+            if response.status_code in transient_status and attempt < max_retries:
+                time.sleep(min(2 ** attempt, 20) + random.uniform(0, 0.5))
+                continue
+            response.raise_for_status()
+            return response.json()
+        except Exception as exc:
+            last_error = exc
+            if attempt >= max_retries:
+                break
+            time.sleep(min(2 ** attempt, 20) + random.uniform(0, 0.5))
+
+    raise RuntimeError(f"Could not fetch {label} from {url}: {str(last_error)[:300]}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 10a. AWS instance specifications
+# MAGIC
+# MAGIC Resolved from the best available source, in this order:
+# MAGIC
+# MAGIC 1. **This workspace's `clusters/list-node-types` API** &mdash; the vCPU, memory, GPU and local-disk figures
+# MAGIC    Databricks itself reports for every instance type it can launch here. Authoritative for this workspace.
+# MAGIC 2. **AWS's public pricing metadata** &mdash; the same figures published by AWS for every EC2 instance type
+# MAGIC    that exists, including ones this workspace cannot launch. Covers node types that appear only in
+# MAGIC    billing history.
+# MAGIC 3. **Unknown** &mdash; flagged in the output as `unknown_node_type`, never guessed.
+# MAGIC
+# MAGIC Every sizing row carries `aws_spec_source` so you can see which of the three produced it.
+
+# COMMAND ----------
+
+# AWS publishes its own workload taxonomy on every instance type. This maps those exact published
+# labels onto the vocabulary the sizing engine uses. Anything AWS adds later is reported as an
+# unmapped label rather than being silently guessed at.
+AWS_INSTANCE_FAMILY_TO_CATEGORY: Dict[str, str] = {
+    "general purpose": "general_purpose",
+    "compute optimized": "compute_optimized",
+    "memory optimized": "memory_optimized",
+    "storage optimized": "storage_optimized",
+    "gpu instance": "gpu",
+    "fpga instances": "accelerated_other",
+    "machine learning asic instances": "accelerated_other",
+    "media accelerator instances": "accelerated_other",
+}
+
+_AWS_MEMORY_RE = re.compile(r"^\s*([\d,.]+)\s*(GiB|GB|MiB)\s*$", re.IGNORECASE)
+# "2 x 300 NVMe SSD", "8 x 1000 SSD", "24 x 2000 HDD", "2x900 GB NVMe SSD"
+_AWS_STORAGE_MULTI_RE = re.compile(r"^\s*(\d+)\s*x\s*([\d,.]+)\s*(.*)$", re.IGNORECASE)
+# "900 GB NVMe SSD"
+_AWS_STORAGE_SINGLE_RE = re.compile(r"^\s*([\d,.]+)\s*(?:GB|GiB)?\s*(.*)$", re.IGNORECASE)
+
+
+def parse_aws_memory_gb(text: Any) -> Optional[float]:
+    """Convert an AWS memory string such as ``"128 GiB"`` into a number of GB."""
+    match = _AWS_MEMORY_RE.match(str(text or ""))
     if not match:
         return None
-
-    family, size = match.group(1), match.group(2)
-    if family not in AWS_FAMILY_SPECS or size not in AWS_SIZE_VCPU:
+    value = to_float(match.group(1).replace(",", ""))
+    if value is None:
         return None
+    return round(value / 1024.0, 3) if match.group(2).lower() == "mib" else value
 
-    memory_per_vcpu, category, has_local_nvme = AWS_FAMILY_SPECS[family]
-    vcpu = AWS_SIZE_VCPU[size]
-    gpus = AWS_GPU_COUNTS.get(f"{family}.{size}", 1 if category == "gpu" else 0)
 
-    return {
-        "vcpu": vcpu,
-        "memory_gb": round(vcpu * memory_per_vcpu, 1),
-        "category": category,
-        "has_local_nvme": has_local_nvme,
-        "num_gpus": gpus,
-        "aws_family": family,
-        "aws_size": size,
-    }
+def parse_aws_storage(text: Any) -> Tuple[Optional[float], bool]:
+    """Convert an AWS storage string into ``(total_local_disk_gb, has_local_nvme)``.
+
+    Handles every shape AWS publishes: ``"EBS only"`` (no local disk), ``"2 x 300 NVMe SSD"``,
+    ``"900 GB NVMe SSD"``, ``"8 x 1000 SSD"`` and ``"24 x 2000 HDD"``.
+    """
+    raw = str(text or "").strip()
+    if not raw or raw.lower() in {"ebs only", "ebsonly", "na", "n/a", "none"}:
+        return 0.0, False
+
+    has_nvme = "nvme" in raw.lower()
+
+    match = _AWS_STORAGE_MULTI_RE.match(raw)
+    if match:
+        count = to_float(match.group(1))
+        size = to_float(match.group(2).replace(",", ""))
+        if count is not None and size is not None:
+            return round(count * size, 1), has_nvme
+
+    match = _AWS_STORAGE_SINGLE_RE.match(raw)
+    if match:
+        size = to_float(match.group(1).replace(",", ""))
+        if size is not None:
+            return round(size, 1), has_nvme
+
+    return None, has_nvme
+
+
+def fetch_aws_instance_specs(timeout: int = 60, max_retries: int = 2) -> Dict[str, Dict[str, Any]]:
+    """Fetch the public specification of every AWS EC2 instance type.
+
+    Returns a dict keyed by instance type (``"r5d.4xlarge"``). Returns whatever it managed to
+    collect: an unreachable endpoint degrades coverage, it never stops the notebook.
+    """
+    specs: Dict[str, Dict[str, Any]] = {}
+    unmapped_families: set = set()
+
+    for location in AWS_INSTANCE_SPEC_LOCATIONS:
+        endpoint = AWS_INSTANCE_SPEC_ENDPOINT.format(location=quote(location))
+        try:
+            payload = fetch_reference_json(
+                endpoint, timeout=timeout, max_retries=max_retries,
+                label=f"AWS instance specifications ({location})",
+            )
+        except Exception as exc:
+            record_reference_source("AWS instance specifications", endpoint, "unavailable", str(exc))
+            continue
+
+        added = 0
+        for region_items in (payload.get("regions") or {}).values():
+            for item in (region_items or {}).values():
+                instance_type = item.get("Instance Type")
+                if not instance_type or instance_type in specs:
+                    continue
+
+                family_label = str(item.get("Instance Family") or "").strip()
+                category = AWS_INSTANCE_FAMILY_TO_CATEGORY.get(family_label.lower())
+                if family_label and category is None:
+                    unmapped_families.add(family_label)
+
+                local_disk_gb, has_local_nvme = parse_aws_storage(item.get("Storage"))
+                specs[instance_type] = {
+                    "vcpu": to_int(item.get("vCPU")),
+                    "memory_gb": parse_aws_memory_gb(item.get("Memory")),
+                    "category": category or "general_purpose",
+                    "aws_instance_family_label": family_label or None,
+                    "has_local_nvme": has_local_nvme,
+                    "local_disk_gb": local_disk_gb,
+                    # AWS does not publish an accelerator count here. GPU counts come from the
+                    # workspace API, which does report them, so this stays honest rather than guessed.
+                    "num_gpus": None,
+                    "instance_type_id": instance_type,
+                    "spec_source": "aws_public_pricing_api",
+                }
+                added += 1
+
+        published = str((payload.get("manifest") or {}).get("hawkFilePublicationDate") or "")
+        record_reference_source(
+            "AWS instance specifications", endpoint, "ok",
+            f"{added} new instance types from {location}"
+            + (f", AWS published {published[:10]}" if published else ""),
+        )
+
+    if unmapped_families:
+        print(
+            f"[warn] AWS published {len(unmapped_families)} instance-family label(s) this notebook does not "
+            f"classify: {', '.join(sorted(unmapped_families))}. Those types default to general purpose."
+        )
+    return specs
+
+
+AWS_PUBLIC_SPEC_INDEX: Dict[str, Dict[str, Any]] = fetch_aws_instance_specs()
 
 
 def build_aws_node_type_index(node_type_items: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """Index the live ``list-node-types`` response by ``node_type_id``.
 
-    This is the authoritative source of AWS vCPU and memory for this workspace.
+    This is the authoritative source of AWS vCPU, memory and GPU count for this workspace. Anything
+    Databricks does not report (workload category, NVMe presence) is filled in from AWS's own
+    published specification for the same instance type.
     """
     index: Dict[str, Dict[str, Any]] = {}
     for item in node_type_items or []:
@@ -1733,15 +1864,16 @@ def build_aws_node_type_index(node_type_items: Sequence[Dict[str, Any]]) -> Dict
 
         vcpu = to_int(item.get("num_cores"))
         memory_mb = to_float(item.get("memory_mb"))
-        derived = parse_aws_instance_type(instance_type_id) or {}
+        published = AWS_PUBLIC_SPEC_INDEX.get(str(instance_type_id)) or {}
 
         index[str(node_type_id)] = {
-            "vcpu": vcpu if vcpu else derived.get("vcpu"),
-            "memory_gb": round(memory_mb / 1024.0, 1) if memory_mb else derived.get("memory_gb"),
-            "category": derived.get("category", "general_purpose"),
-            "has_local_nvme": bool(local_nvme_disks or local_disks or derived.get("has_local_nvme")),
-            "local_disk_gb": local_disk_gb,
-            "num_gpus": to_int(item.get("num_gpus")) or derived.get("num_gpus") or 0,
+            "vcpu": vcpu if vcpu else published.get("vcpu"),
+            "memory_gb": round(memory_mb / 1024.0, 1) if memory_mb else published.get("memory_gb"),
+            "category": published.get("category", "general_purpose"),
+            "aws_instance_family_label": published.get("aws_instance_family_label"),
+            "has_local_nvme": bool(local_nvme_disks or local_disks or published.get("has_local_nvme")),
+            "local_disk_gb": local_disk_gb or published.get("local_disk_gb"),
+            "num_gpus": to_int(item.get("num_gpus")) or 0,
             "instance_type_id": instance_type_id,
             "description": item.get("description"),
             "is_deprecated": bool(item.get("is_deprecated")),
@@ -1754,125 +1886,493 @@ AWS_NODE_TYPE_INDEX = build_aws_node_type_index(node_types)
 
 
 def resolve_aws_node_spec(node_type_id: Optional[str]) -> Dict[str, Any]:
-    """Resolve an AWS node type to a spec dict, recording which source was used."""
+    """Resolve an AWS node type to a spec dict, recording which source produced it."""
+    unknown = {
+        "vcpu": None, "memory_gb": None, "category": None, "has_local_nvme": None,
+        "num_gpus": None, "instance_type_id": None, "local_disk_gb": None,
+        "aws_instance_family_label": None, "spec_source": "not_specified",
+    }
     if not node_type_id:
-        return {
-            "vcpu": None, "memory_gb": None, "category": None, "has_local_nvme": None,
-            "num_gpus": None, "instance_type_id": None, "local_disk_gb": None,
-            "spec_source": "not_specified",
-        }
+        return unknown
 
     key = str(node_type_id)
     if key in AWS_NODE_TYPE_INDEX:
         return dict(AWS_NODE_TYPE_INDEX[key])
+    if key in AWS_PUBLIC_SPEC_INDEX:
+        return dict(AWS_PUBLIC_SPEC_INDEX[key])
 
-    derived = parse_aws_instance_type(key)
-    if derived:
-        derived = dict(derived)
-        derived.update({"instance_type_id": key, "spec_source": "derived_from_instance_name", "local_disk_gb": None})
-        return derived
-
-    return {
-        "vcpu": None, "memory_gb": None, "category": None, "has_local_nvme": None,
-        "num_gpus": None, "instance_type_id": key, "local_disk_gb": None,
-        "spec_source": "unknown_node_type",
-    }
+    return {**unknown, "instance_type_id": key, "spec_source": "unknown_node_type"}
 
 
-print(f"AWS node type specs available from the workspace API: {len(AWS_NODE_TYPE_INDEX)}")
-print(f"AWS families understood by the name-derivation fallback: {len(AWS_FAMILY_SPECS)}")
+print(f"AWS node type specs from this workspace's API : {len(AWS_NODE_TYPE_INDEX)}")
+print(f"AWS instance specs from AWS's public API      : {len(AWS_PUBLIC_SPEC_INDEX)}")
+if not AWS_PUBLIC_SPEC_INDEX:
+    print(
+        "[warn] AWS's public specification endpoint was unreachable. Node types this workspace cannot "
+        "launch will be reported as 'unknown_node_type' rather than sized. Check outbound HTTPS access."
+    )
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Azure VM catalog
+# MAGIC ### 10b. Azure VM specifications
 # MAGIC
-# MAGIC The Azure VM sizes supported by Azure Databricks, with vCPU, memory and local NVMe temp storage.
-# MAGIC `armSkuName` values (`Standard_E8ds_v5`) are exactly what the Retail Prices API expects.
+# MAGIC Read from the Azure pricing calculator's public data feed. As well as vCPU, memory, temp disk and GPU
+# MAGIC model, that feed carries **Microsoft's own classification** of every size into a workload family
+# MAGIC (general purpose, memory optimized, compute optimized, storage optimized, GPU, HPC), so the sizing
+# MAGIC engine uses Azure's classification rather than one invented here.
+# MAGIC
+# MAGIC A note on disk figures: `local_ssd_gb` is the Azure **temp (resource) disk**, which is the local NVMe
+# MAGIC that Databricks uses for shuffle and disk cache. L-series sizes additionally carry much larger NVMe
+# MAGIC *data* disks that are not counted in this column &mdash; which is why storage-optimized workloads are
+# MAGIC steered by Azure's family classification, not by this number.
 
 # COMMAND ----------
 
-def _azure_family(
-    sku_template: str,
-    family: str,
-    category: str,
-    generation_rank: int,
-    has_local_ssd: bool,
-    specs: Sequence[Tuple[int, float, int, int]],
-    gpu_model: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    """Expand one Azure VM family into catalog rows.
+# Microsoft's own workload headings in the calculator feed, mapped to this notebook's vocabulary.
+AZURE_CATEGORY_FROM_API: Dict[str, str] = {
+    "generalpurpose": "general_purpose",
+    "computeoptimized": "compute_optimized",
+    "memoryoptimized": "memory_optimized",
+    "storageoptimized": "storage_optimized",
+    "gpu": "gpu",
+    "highperformancecompute": "high_performance_compute",
+}
+# A handful of legacy sizes are listed under more than one heading. The most specific wins.
+AZURE_CATEGORY_PRIORITY = [
+    "gpu", "storage_optimized", "high_performance_compute",
+    "compute_optimized", "memory_optimized", "general_purpose",
+]
 
-    ``specs`` entries are ``(vcpu, memory_gb, local_ssd_gb, num_gpus)`` and ``sku_template`` is
-    formatted with the vCPU count, for example ``"Standard_E{}ds_v5"``.
+# Calculator keys look like "linux-e8dsv5-standard"; armSkuName looks like "Standard_E8ds_v5".
+# Stripping the OS prefix, the tier suffix and every separator makes the two directly comparable.
+_AZURE_OS_PREFIX_RE = re.compile(r"^(linux|windows|redhat|rhel|suse|sles|ubuntu(advantage)?|centos)-")
+_AZURE_TIER_SUFFIX_RE = re.compile(r"-(standard|basic|lowpriority|spot)$")
+# "1X T4", "8x A100 (NVlink)", "1/2X A10", "4". The fraction alternative must come first or a
+# leading "1" would be matched out of "1/2" and the partition silently misread as a whole GPU.
+_AZURE_GPU_RE = re.compile(r"^\s*(\d+\s*/\s*\d+|\d+(?:\.\d+)?)\s*[xX]?\s*(.*)$")
+
+
+def azure_size_key(value: Any) -> str:
+    """Reduce an Azure size name to a comparable key: lowercase, letters and digits only."""
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def azure_sku_to_size_key(sku: Optional[str]) -> str:
+    """Reduce an ``armSkuName`` such as ``Standard_E8ds_v5`` to the same comparable key."""
+    name = str(sku or "")
+    if name.startswith("Standard_"):
+        name = name[len("Standard_"):]
+    return azure_size_key(name)
+
+
+def parse_azure_gpu(value: Any) -> Tuple[float, Optional[str]]:
+    """Parse an Azure GPU description into ``(gpu_count, gpu_model)``.
+
+    Fractional counts such as ``"1/2X A10"`` describe a partitioned GPU shared between VMs, so they
+    are returned as a fraction and never satisfy a workload that needs a whole accelerator.
     """
-    return [
-        {
-            "azure_vm_sku": sku_template.format(vcpu),
-            "azure_vm_family": family,
-            "category": category,
-            "generation_rank": generation_rank,
+    raw = str(value or "").strip()
+    if not raw:
+        return 0.0, None
+
+    match = _AZURE_GPU_RE.match(raw)
+    if not match:
+        return 1.0, raw
+
+    count_text, model = match.group(1), (match.group(2) or "").strip()
+    if "/" in count_text:
+        numerator, _, denominator = count_text.partition("/")
+        top, bottom = to_float(numerator.strip()), to_float(denominator.strip())
+        count = (top / bottom) if top is not None and bottom else 1.0
+    else:
+        count = to_float(count_text) or 1.0
+
+    return float(count), model or None
+
+
+def fetch_azure_vm_specs(timeout: int = 120, max_retries: int = 2) -> Dict[str, Dict[str, Any]]:
+    """Fetch the specification of every Azure VM size from the public pricing calculator feed.
+
+    Returns a dict keyed by :func:`azure_size_key`. Returns ``{}`` when the endpoint is unreachable,
+    which the caller reports rather than papering over.
+    """
+    try:
+        payload = fetch_reference_json(
+            AZURE_VM_SPEC_ENDPOINT,
+            params={"culture": "en-us", "discount": "mosp"},
+            timeout=timeout,
+            max_retries=max_retries,
+            label="Azure VM specifications",
+        )
+    except Exception as exc:
+        record_reference_source("Azure VM specifications", AZURE_VM_SPEC_ENDPOINT, "unavailable", str(exc))
+        return {}
+
+    # 1. Microsoft's own classification of each size into a workload family.
+    category_by_size: Dict[str, str] = {}
+    for group in payload.get("dropdown") or []:
+        category = AZURE_CATEGORY_FROM_API.get(str(group.get("slug") or "").lower())
+        if not category:
+            continue
+        for series in group.get("series") or []:
+            for instance in series.get("instances") or []:
+                key = azure_size_key(instance.get("slug"))
+                if not key:
+                    continue
+                current = category_by_size.get(key)
+                if current is None or AZURE_CATEGORY_PRIORITY.index(category) < AZURE_CATEGORY_PRIORITY.index(current):
+                    category_by_size[key] = category
+
+    # 2. The hardware specification of each size.
+    specs: Dict[str, Dict[str, Any]] = {}
+    for offer_key, offer in (payload.get("offers") or {}).items():
+        if offer.get("offerType") != "compute":
+            continue
+        vcpu = to_int(offer.get("cores"))
+        memory_gb = to_float(offer.get("ram"))
+        if not vcpu or memory_gb is None:
+            continue
+
+        key = azure_size_key(_AZURE_TIER_SUFFIX_RE.sub("", _AZURE_OS_PREFIX_RE.sub("", str(offer_key))))
+        if not key:
+            continue
+
+        series = str(offer.get("series") or "").strip()
+        generation = re.search(r"v(\d+)$", series, re.IGNORECASE)
+        gpu_count, gpu_model = parse_azure_gpu(offer.get("gpu"))
+        temp_disk_gb = to_float(offer.get("diskSize")) or 0.0
+
+        specs[key] = {
+            "azure_vm_family": series or None,
+            "category": category_by_size.get(key),
+            # Newer hardware generations win an otherwise exact tie in the sizing engine.
+            "generation_rank": int(generation.group(1)) if generation else 1,
             "vcpu": vcpu,
             "memory_gb": float(memory_gb),
             "memory_per_vcpu": round(memory_gb / vcpu, 2),
-            "local_ssd_gb": local_ssd_gb,
-            "has_local_ssd": has_local_ssd and local_ssd_gb > 0,
-            "num_gpus": gpus,
+            "local_ssd_gb": temp_disk_gb,
+            "has_local_ssd": temp_disk_gb > 0,
+            "num_gpus": int(gpu_count) if float(gpu_count).is_integer() else gpu_count,
             "gpu_model": gpu_model,
         }
-        for vcpu, memory_gb, local_ssd_gb, gpus in specs
-    ]
+
+    record_reference_source(
+        "Azure VM specifications", AZURE_VM_SPEC_ENDPOINT, "ok",
+        f"{len(specs)} VM sizes, {len(category_by_size)} classified by Microsoft into workload families",
+    )
+    return specs
 
 
-AZURE_VM_CATALOG: List[Dict[str, Any]] = (
-    # General purpose, ~4 GiB per vCPU
-    _azure_family("Standard_D{}s_v3", "Dsv3", "general_purpose", 1, False,
-                  [(4, 16, 0, 0), (8, 32, 0, 0), (16, 64, 0, 0), (32, 128, 0, 0), (64, 256, 0, 0)])
-    + _azure_family("Standard_D{}ds_v4", "Ddsv4", "general_purpose", 2, True,
-                    [(4, 16, 150, 0), (8, 32, 300, 0), (16, 64, 600, 0), (32, 128, 1200, 0),
-                     (48, 192, 1800, 0), (64, 256, 2400, 0)])
-    + _azure_family("Standard_D{}ads_v5", "Dadsv5", "general_purpose", 3, True,
-                    [(4, 16, 150, 0), (8, 32, 300, 0), (16, 64, 600, 0), (32, 128, 1200, 0),
-                     (48, 192, 1800, 0), (64, 256, 2400, 0), (96, 384, 3600, 0)])
-    + _azure_family("Standard_D{}ds_v5", "Ddsv5", "general_purpose", 4, True,
-                    [(4, 16, 150, 0), (8, 32, 300, 0), (16, 64, 600, 0), (32, 128, 1200, 0),
-                     (48, 192, 1800, 0), (64, 256, 2400, 0), (96, 384, 3600, 0)])
-    # Memory optimized, ~8 GiB per vCPU
-    + _azure_family("Standard_E{}s_v3", "Esv3", "memory_optimized", 1, False,
-                    [(4, 32, 0, 0), (8, 64, 0, 0), (16, 128, 0, 0), (20, 160, 0, 0), (32, 256, 0, 0), (64, 432, 0, 0)])
-    + _azure_family("Standard_E{}ds_v4", "Edsv4", "memory_optimized", 2, True,
-                    [(4, 32, 150, 0), (8, 64, 300, 0), (16, 128, 600, 0), (20, 160, 750, 0),
-                     (32, 256, 1200, 0), (48, 384, 1800, 0), (64, 504, 2400, 0)])
-    + _azure_family("Standard_E{}ads_v5", "Eadsv5", "memory_optimized", 3, True,
-                    [(4, 32, 150, 0), (8, 64, 300, 0), (16, 128, 600, 0), (20, 160, 750, 0),
-                     (32, 256, 1200, 0), (48, 384, 1800, 0), (64, 512, 2400, 0), (96, 672, 3600, 0)])
-    + _azure_family("Standard_E{}ds_v5", "Edsv5", "memory_optimized", 4, True,
-                    [(4, 32, 150, 0), (8, 64, 300, 0), (16, 128, 600, 0), (20, 160, 750, 0),
-                     (32, 256, 1200, 0), (48, 384, 1800, 0), (64, 512, 2400, 0), (96, 672, 3600, 0)])
-    # Compute optimized, ~2 GiB per vCPU
-    + _azure_family("Standard_F{}s_v2", "Fsv2", "compute_optimized", 2, True,
-                    [(4, 8, 32, 0), (8, 16, 64, 0), (16, 32, 128, 0), (32, 64, 256, 0),
-                     (48, 96, 384, 0), (64, 128, 512, 0), (72, 144, 576, 0)])
-    # Storage optimized, very large local NVMe
-    + _azure_family("Standard_L{}s_v2", "Lsv2", "storage_optimized", 1, True,
-                    [(8, 64, 1920, 0), (16, 128, 3840, 0), (32, 256, 7680, 0),
-                     (48, 384, 11520, 0), (64, 512, 15360, 0), (80, 640, 19200, 0)])
-    + _azure_family("Standard_L{}s_v3", "Lsv3", "storage_optimized", 2, True,
-                    [(8, 64, 1920, 0), (16, 128, 3840, 0), (32, 256, 7680, 0),
-                     (48, 384, 11520, 0), (64, 512, 15360, 0), (80, 640, 19200, 0)])
-    # GPU
-    + _azure_family("Standard_NC{}as_T4_v3", "NCasT4v3", "gpu", 1, True,
-                    [(4, 28, 176, 1), (8, 56, 352, 1), (16, 110, 352, 1), (64, 440, 2880, 4)], gpu_model="NVIDIA T4")
-    + _azure_family("Standard_NC{}ads_A100_v4", "NCadsA100v4", "gpu", 2, True,
-                    [(24, 220, 1123, 1), (48, 440, 2246, 2), (96, 880, 4492, 4)], gpu_model="NVIDIA A100 80GB")
-    + _azure_family("Standard_ND{}asr_v4", "NDasrv4", "gpu", 3, True,
-                    [(96, 900, 6000, 8)], gpu_model="NVIDIA A100 40GB")
-)
+AZURE_VM_SPEC_INDEX: Dict[str, Dict[str, Any]] = fetch_azure_vm_specs()
+print(f"Azure VM sizes published by the Azure pricing API: {len(AZURE_VM_SPEC_INDEX)}")
+if not AZURE_VM_SPEC_INDEX:
+    print(
+        "[warn] The Azure VM specification endpoint was unreachable, so no Azure sizing can be produced. "
+        f"Check outbound HTTPS access to {AZURE_VM_SPEC_ENDPOINT} and re-run. Sections 7 to 16 "
+        "(your current AWS inventory and consumption) are unaffected."
+    )
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 10c. Which Azure sizes are eligible for your cluster
+# MAGIC
+# MAGIC Two things narrow the full Azure catalog down to the sizes the sizing engine may choose from.
+# MAGIC
+# MAGIC **1. Can you actually buy it in your region?** The notebook asks the Azure Retail Prices API which sizes
+# MAGIC carry a published price in your selected region and keeps only those. This is why the cost table never
+# MAGIC reports "no price found" &mdash; an unpriced size is never recommended in the first place.
+# MAGIC
+# MAGIC **2. Does Azure Databricks support it?** No public API answers this, so one of two things happens:
+# MAGIC
+# MAGIC * **Authoritative** &mdash; if you filled in the optional Azure Databricks workspace settings, the supported
+# MAGIC   list is read from that workspace's own `clusters/list-node-types` API. Nothing is created or changed there.
+# MAGIC * **Policy** &mdash; otherwise the eligibility rules below are applied and **printed in full**, so you can see
+# MAGIC   and challenge every one of them. They exclude size classes Azure Databricks does not run clusters on.
+# MAGIC
+# MAGIC The funnel table shows how many sizes each step removed.
+
+# COMMAND ----------
+
+# ---------------------------------------------------------------------------------------------
+#  ELIGIBILITY POLICY - the only judgement calls in this section, all printed below.
+#  These are deliberately not "data": no API publishes which VM sizes Azure Databricks supports.
+#  Fill in the optional Azure Databricks workspace settings to replace all of this with the
+#  authoritative list read from a real workspace.
+# ---------------------------------------------------------------------------------------------
+
+# The workload families the sizing engine will search. High-performance-compute sizes are excluded
+# because Azure Databricks does not offer them.
+AZURE_SIZING_CATEGORIES = [
+    "general_purpose", "memory_optimized", "compute_optimized", "storage_optimized", "gpu",
+]
+
+# Size bounds for a Databricks node. The lower bound is Azure Databricks' smallest practical worker;
+# the upper bound keeps the engine away from specialist sizes that a Spark cluster cannot use well.
+AZURE_ELIGIBLE_MIN_VCPU = 4
+AZURE_ELIGIBLE_MAX_VCPU = 128
+
+# Families excluded by name, matched against the family Azure itself reports for each size.
+# (rule name, regular expression on the Azure family, why)
+AZURE_FAMILY_EXCLUSIONS: List[Tuple[str, str, str]] = [
+    ("burstable", r"^B",
+     "B-series burst on a CPU credit balance, so sustained Spark work throttles unpredictably."),
+    ("confidential_compute", r"^(DC|EC)",
+     "Confidential-compute sizes are for enclave workloads and are not general Databricks compute."),
+    ("legacy_a_series", r"^A(v\d+)?$",
+     "First-generation A-series hardware is retired from Databricks node type lists."),
+    ("sap_certified", r"^SapHana",
+     "SAP HANA certified sizes are sold for SAP workloads, not for Spark clusters."),
+    ("very_large_memory", r"^M",
+     "M-series sizes go far beyond a Spark node; scale out with more workers instead."),
+]
+
+# "Standard_E32-16as_v6" is a constrained-vCPU variant sold for per-core licensing, not for Spark.
+AZURE_CONSTRAINED_VCPU_RE = re.compile(r"^Standard_[A-Za-z]+\d+-\d+")
+
+AZURE_CATALOG_DIAGNOSTICS: Dict[str, Any] = {
+    "eligibility_source": "policy",
+    "priced_region": None,
+    "priced_sku_count": None,
+    "authoritative_sku_count": None,
+    "error": None,
+}
+
+
+def fetch_priced_azure_skus(region: str, currency: str) -> Optional[set]:
+    """Return every ``armSkuName`` with a published consumption price in ``region``.
+
+    ``None`` means the question could not be answered, which is different from "nothing is priced".
+    """
+    try:
+        items = fetch_azure_price_items(
+            f"serviceName eq 'Virtual Machines' and armRegionName eq '{region}' and priceType eq 'Consumption'",
+            currency_code=currency,
+            timeout=CONFIG["azure_price_timeout_seconds"],
+            max_retries=CONFIG["azure_price_max_retries"],
+            max_pages=60,
+        )
+    except Exception as exc:
+        AZURE_CATALOG_DIAGNOSTICS["error"] = str(exc)[:300]
+        record_reference_source("Azure sizes purchasable in region", AZURE_PRICES_ENDPOINT, "unavailable", str(exc))
+        return None
+
+    priced = {
+        item["armSkuName"]
+        for item in items
+        if item.get("armSkuName")
+        and item.get("type") != "DevTestConsumption"
+        and "windows" not in str(item.get("productName", "")).lower()
+        and "low priority" not in str(item.get("meterName", "")).lower()
+    }
+    record_reference_source(
+        "Azure sizes purchasable in region", AZURE_PRICES_ENDPOINT, "ok",
+        f"{len(priced)} SKUs priced in {region} ({currency})",
+    )
+    return priced
+
+
+def fetch_azure_databricks_supported_skus() -> Optional[set]:
+    """Read the authoritative supported-VM list from a nominated Azure Databricks workspace.
+
+    Entirely optional and strictly read-only. Returns ``None`` when not configured or unreachable.
+    The token is read from a Databricks secret (or an environment variable) and is never printed.
+    """
+    workspace_url = CONFIG["azure_databricks_workspace_url"]
+    if not workspace_url:
+        return None
+    if not workspace_url.startswith(("http://", "https://")):
+        workspace_url = f"https://{workspace_url}"
+
+    azure_token = env_str("AZURE_DATABRICKS_TOKEN")
+    secret_ref = CONFIG["azure_databricks_token_secret"]
+    if not azure_token and secret_ref and dbutils_obj is not None:
+        scope, _, key = secret_ref.partition("/")
+        if not scope or not key:
+            print(f"[warn] Azure Databricks secret reference must be 'scope/key', got {secret_ref!r}. Ignoring it.")
+            return None
+        try:
+            azure_token = dbutils_obj.secrets.get(scope=scope, key=key)
+        except Exception as exc:
+            print(f"[warn] Could not read the Azure Databricks token from secret {secret_ref}: {str(exc)[:200]}")
+            return None
+
+    if not azure_token:
+        print(
+            "[warn] An Azure Databricks workspace URL was given but no token was found. Set the "
+            "'E2' secret reference, or the AZURE_DATABRICKS_TOKEN environment variable. "
+            "Falling back to the printed eligibility policy."
+        )
+        return None
+
+    endpoint = f"{workspace_url}/api/2.0/clusters/list-node-types"
+    try:
+        response = reference_data_session.get(
+            endpoint,
+            headers={"Authorization": f"Bearer {azure_token}"},
+            timeout=CONFIG["api_timeout_seconds"],
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        print(f"[warn] Could not read node types from the Azure Databricks workspace: {str(exc)[:200]}")
+        record_reference_source("Azure Databricks supported VM sizes", endpoint, "unavailable", str(exc))
+        return None
+
+    supported = {
+        str(item.get("node_type_id"))
+        for item in payload.get("node_types") or []
+        if item.get("node_type_id") and not item.get("is_deprecated")
+    }
+    if not supported:
+        print("[warn] The Azure Databricks workspace returned no node types. Falling back to the eligibility policy.")
+        return None
+
+    record_reference_source(
+        "Azure Databricks supported VM sizes", endpoint, "ok",
+        f"{len(supported)} node types read from the nominated Azure Databricks workspace",
+    )
+    return supported
+
+
+def build_azure_vm_catalog() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Narrow every published Azure VM size down to the ones this cluster may be sized onto.
+
+    Returns ``(catalog_rows, funnel_rows)``. The funnel records how many sizes each step removed so
+    the customer can audit exactly why a size is or is not on the table.
+    """
+    region, currency = CONFIG["azure_region"], CONFIG["azure_currency"]
+    funnel: List[Dict[str, Any]] = []
+
+    def step(name: str, remaining: int, detail: str) -> None:
+        removed = (funnel[-1]["sizes_remaining"] - remaining) if funnel else 0
+        funnel.append({"step": name, "sizes_removed": removed, "sizes_remaining": remaining, "detail": detail})
+
+    candidates = {
+        key: dict(spec) for key, spec in AZURE_VM_SPEC_INDEX.items()
+    }
+    step("published by Azure", len(candidates), "every VM size in the Azure pricing catalog")
+
+    candidates = {k: v for k, v in candidates.items() if v.get("category") in AZURE_SIZING_CATEGORIES}
+    step("workload family", len(candidates),
+         "kept " + ", ".join(AZURE_SIZING_CATEGORIES) + " as classified by Azure")
+
+    candidates = {
+        k: v for k, v in candidates.items()
+        if AZURE_ELIGIBLE_MIN_VCPU <= v["vcpu"] <= AZURE_ELIGIBLE_MAX_VCPU
+    }
+    step("node size bounds", len(candidates),
+         f"kept {AZURE_ELIGIBLE_MIN_VCPU} to {AZURE_ELIGIBLE_MAX_VCPU} vCPU per node")
+
+    # Which sizes can actually be bought in the customer's region, and at what name.
+    priced_skus = None
+    if CONFIG["run_azure_pricing"]:
+        priced_skus = fetch_priced_azure_skus(region, currency)
+    AZURE_CATALOG_DIAGNOSTICS["priced_region"] = region
+    AZURE_CATALOG_DIAGNOSTICS["priced_sku_count"] = None if priced_skus is None else len(priced_skus)
+
+    rows: List[Dict[str, Any]] = []
+    if priced_skus is not None:
+        for sku in sorted(priced_skus):
+            spec = candidates.get(azure_sku_to_size_key(sku))
+            if spec:
+                rows.append({**spec, "azure_vm_sku": sku, "priced_in_region": True})
+        step("purchasable in your region", len(rows),
+             f"{len(priced_skus)} SKUs carry a published price in {region}")
+    else:
+        # The specification feed names sizes by slug ("e8dsv5"), not by armSkuName
+        # ("Standard_E8ds_v5"), and the two are not reliably interconvertible. Without the price
+        # list there is no trustworthy SKU name to hand to the sizing engine, so the catalog is
+        # empty and the notebook says so rather than inventing names.
+        step("purchasable in your region", 0,
+             "SKIPPED - the Azure Retail Prices API was unavailable or live pricing is switched off")
+
+    before = len(rows)
+    rows = [row for row in rows if not AZURE_CONSTRAINED_VCPU_RE.match(row["azure_vm_sku"] or "")]
+    step("constrained-vCPU variants", len(rows),
+         f"removed {before - len(rows)} per-core-licensing sizes such as Standard_E32-16as_v6")
+
+    authoritative = fetch_azure_databricks_supported_skus()
+    AZURE_CATALOG_DIAGNOSTICS["authoritative_sku_count"] = None if authoritative is None else len(authoritative)
+
+    if authoritative is not None:
+        AZURE_CATALOG_DIAGNOSTICS["eligibility_source"] = "azure_databricks_workspace"
+        rows = [row for row in rows if row["azure_vm_sku"] in authoritative]
+        step("supported by Azure Databricks", len(rows),
+             "AUTHORITATIVE - read from the Azure Databricks workspace you nominated")
+    else:
+        AZURE_CATALOG_DIAGNOSTICS["eligibility_source"] = "policy"
+        for rule_name, pattern, _reason in AZURE_FAMILY_EXCLUSIONS:
+            compiled = re.compile(pattern, re.IGNORECASE)
+            before = len(rows)
+            rows = [row for row in rows if not compiled.match(str(row.get("azure_vm_family") or ""))]
+            step(f"policy: exclude {rule_name}", len(rows), f"removed {before - len(rows)} sizes")
+
+    for row in rows:
+        row.pop("_size_key", None)
+        row["eligibility_source"] = AZURE_CATALOG_DIAGNOSTICS["eligibility_source"]
+
+    return rows, funnel
+
+
+AZURE_VM_CATALOG, AZURE_VM_CATALOG_FUNNEL = build_azure_vm_catalog()
 AZURE_VM_INDEX: Dict[str, Dict[str, Any]] = {row["azure_vm_sku"]: row for row in AZURE_VM_CATALOG}
-azure_vm_catalog_pdf = pd.DataFrame(AZURE_VM_CATALOG)
 
-print(f"Azure VM catalog: {len(AZURE_VM_CATALOG)} SKUs across {azure_vm_catalog_pdf['azure_vm_family'].nunique()} families.")
+azure_vm_catalog_pdf = pd.DataFrame(
+    AZURE_VM_CATALOG,
+    columns=[
+        "azure_vm_sku", "azure_vm_family", "category", "generation_rank", "vcpu", "memory_gb",
+        "memory_per_vcpu", "local_ssd_gb", "has_local_ssd", "num_gpus", "gpu_model",
+        "priced_in_region", "eligibility_source",
+    ],
+).sort_values(["category", "azure_vm_family", "vcpu"], ignore_index=True)
+
+azure_vm_catalog_funnel_pdf = pd.DataFrame(AZURE_VM_CATALOG_FUNNEL)
+reference_data_sources_pdf = pd.DataFrame(REFERENCE_DATA_SOURCES)
+
+print()
+print("How the Azure VM catalog was narrowed down:")
+for entry in AZURE_VM_CATALOG_FUNNEL:
+    print(f"  {entry['sizes_remaining']:>5}  after {entry['step']:<34} {entry['detail']}")
+
+print()
+if AZURE_CATALOG_DIAGNOSTICS["eligibility_source"] == "azure_databricks_workspace":
+    print("Eligibility source: AUTHORITATIVE - the Azure Databricks workspace you nominated.")
+else:
+    print("Eligibility source: the policy below. No public API publishes which VM sizes Azure Databricks")
+    print("supports, so these rules are applied. Fill in settings E1 and E2 to replace them with the")
+    print("authoritative list read from a real Azure Databricks workspace.")
+    for rule_name, pattern, reason in AZURE_FAMILY_EXCLUSIONS:
+        print(f"  - exclude {rule_name:<22} (family matches /{pattern}/): {reason}")
+    print(f"  - keep only {AZURE_ELIGIBLE_MIN_VCPU} to {AZURE_ELIGIBLE_MAX_VCPU} vCPU per node")
+    print("  - exclude constrained-vCPU variants such as Standard_E32-16as_v6")
+
+print()
+if AZURE_VM_CATALOG:
+    families = azure_vm_catalog_pdf["azure_vm_family"].nunique()
+    print(
+        f"Azure VM catalog: {len(AZURE_VM_CATALOG)} sizes across {families} families, "
+        f"all priced in {CONFIG['azure_region']}."
+    )
+    warehouse_vm = CONFIG["azure_sql_warehouse_node_vm"]
+    if warehouse_vm and warehouse_vm not in AZURE_VM_INDEX:
+        print(
+            f"[warn] The SQL warehouse node VM {warehouse_vm} is not available in {CONFIG['azure_region']}. "
+            "SQL warehouse costs will be blank. Set AZURE_SQL_WAREHOUSE_NODE_VM to a size listed below."
+        )
+else:
+    print(
+        f"[warn] No Azure VM sizes are available for {CONFIG['azure_region']}. Azure sizing and cost columns "
+        "will be blank; your AWS inventory and consumption reporting are unaffected. Most likely causes: "
+        "no outbound HTTPS access to the Azure pricing APIs, live pricing switched off in widget D3, or a "
+        "region that does not sell virtual machines."
+    )
+
+print()
+print("Where every number in this section came from:")
+display_pdf(reference_data_sources_pdf, "No reference data sources were recorded")
+display_pdf(azure_vm_catalog_funnel_pdf, "Catalog funnel is empty")
 display_pdf(azure_vm_catalog_pdf, "Azure VM catalog is empty")
 
 # COMMAND ----------
@@ -1883,7 +2383,7 @@ display_pdf(azure_vm_catalog_pdf, "Azure VM catalog is empty")
 # MAGIC The rule in plain English:
 # MAGIC
 # MAGIC 1. **Pick the family.** GPU nodes go to GPU VMs. Otherwise the workload's *memory per vCPU* decides:
-# MAGIC    &ge;&nbsp;7&nbsp;GB &rarr; memory optimized (E), &le;&nbsp;2.5&nbsp;GB &rarr; compute optimized (F), anything
+# MAGIC    &ge;&nbsp;7&nbsp;GB &rarr; memory optimized (E), &le;&nbsp;2.75&nbsp;GB &rarr; compute optimized (F), anything
 # MAGIC    in between &rarr; general purpose (D). AWS storage-optimized nodes (i3, i3en, i4i) go to the L series so the
 # MAGIC    local NVMe is preserved. You can override all of this with the **VM family preference** widget.
 # MAGIC 2. **Pick the size.** The *smallest* VM in that family with **at least** the same vCPU and memory as the AWS
@@ -1891,6 +2391,9 @@ display_pdf(azure_vm_catalog_pdf, "Azure VM catalog is empty")
 # MAGIC 3. **Keep the node count.** Driver and worker counts carry over unchanged, so the comparison is like for like.
 # MAGIC 4. **Report the delta.** Every row shows the vCPU and memory difference so you can see where Azure gives you
 # MAGIC    more or less headroom.
+# MAGIC
+# MAGIC The engine only ever chooses from the live catalog built in section 10, so every recommendation is a size
+# MAGIC that Azure currently sells, at a published price, in your selected region.
 
 # COMMAND ----------
 
@@ -1920,7 +2423,10 @@ def choose_candidate_categories(
     family_preference: str,
 ) -> List[str]:
     """Return the Azure VM categories to search, in priority order."""
-    if num_gpus and num_gpus > 0:
+    # An accelerated AWS node must land on an accelerated Azure node. The GPU count comes from the
+    # workspace API when it knows the node type; for types known only from AWS's public catalog the
+    # count is not published, so AWS's own family classification is the signal.
+    if (num_gpus and num_gpus > 0) or aws_category == "gpu":
         return ["gpu"]
     if family_preference != "auto":
         return [family_preference]
@@ -2073,10 +2579,20 @@ def recommend_azure_vm(
 
             return result(best["azure_vm_sku"], rule, confidence, note)
 
-    largest = sorted(
-        [vm for vm in AZURE_VM_CATALOG if vm["category"] == categories[0]] or AZURE_VM_CATALOG,
-        key=lambda vm: (vm["vcpu"], vm["memory_gb"]),
-    )[-1]
+    candidates_of_preferred_category = [vm for vm in AZURE_VM_CATALOG if vm["category"] == categories[0]]
+    fallback_pool = candidates_of_preferred_category or AZURE_VM_CATALOG
+    if not fallback_pool:
+        return result(
+            None,
+            "azure_catalog_unavailable",
+            "none",
+            (
+                f"No Azure VM sizes are available for {CONFIG['azure_region']}, so no target could be chosen. "
+                "See the catalog funnel in section 10 for the reason."
+            ),
+        )
+
+    largest = sorted(fallback_pool, key=lambda vm: (vm["vcpu"], vm["memory_gb"]))[-1]
     return result(
         largest["azure_vm_sku"],
         "largest_available_in_family",
@@ -3967,6 +4483,8 @@ sizing_outputs = {
     "azure_sql_warehouse_sizing_from_api": warehouse_sizing_pdf,
     "azure_node_type_reference_from_api": node_types_summary_pdf,
     "azure_vm_catalog": azure_vm_catalog_pdf,
+    "azure_vm_catalog_funnel": azure_vm_catalog_funnel_pdf,
+    "reference_data_sources": reference_data_sources_pdf,
     "azure_vm_prices": azure_vm_prices_pdf,
     "azure_pricing_warnings": pricing_warnings_pdf,
     "azure_regions_allowed": azure_regions_pdf,
@@ -4049,21 +4567,50 @@ else:
 # MAGIC | What you consume in DBUs today | Section 15, `dbu_consumption_by_sku` |
 # MAGIC | How an AWS node became an Azure SKU | Section 17, the `mapping_reason` column |
 # MAGIC | The exact price used for a SKU | `azure_vm_prices`, with its retrieval timestamp |
+# MAGIC | Where every hardware spec came from | Section 10, `reference_data_sources` |
+# MAGIC | Why a VM size was or was not considered | Section 10, `azure_vm_catalog_funnel` |
 # MAGIC
 # MAGIC Multiply `monthly_node_hours` by the hourly rate for the matching Azure SKU and you will reproduce the
 # MAGIC monthly cost for any row by hand.
 # MAGIC
+# MAGIC ### Nothing about hardware or price is hard-coded
+# MAGIC
+# MAGIC The notebook ships with **no built-in table of instance sizes or prices**, because both change constantly.
+# MAGIC Every figure is fetched at run time from a public, anonymous endpoint:
+# MAGIC
+# MAGIC | Data | Source | Used for |
+# MAGIC | --- | --- | --- |
+# MAGIC | AWS instance vCPU / memory / NVMe | Your workspace's own node-types API, then AWS's public pricing feed | Describing what you run today |
+# MAGIC | Azure VM vCPU / memory / disk / GPU | The Azure pricing calculator API | Describing what you would run on Azure |
+# MAGIC | Which Azure family a size belongs to | Microsoft's own workload classification in the same API | Choosing D / E / F / L / GPU |
+# MAGIC | Azure VM prices | Azure Retail Prices API | Every cost figure |
+# MAGIC | Databricks DBU prices | `system.billing.list_prices` | Every DBU figure |
+# MAGIC | Valid region names | Azure Retail Prices API | The region dropdown and its validation |
+# MAGIC
+# MAGIC So if Azure launches a new VM size, changes a price, or opens a new region, this notebook picks it up on the
+# MAGIC next run with no code change. The only date-stamped item in the notebook is the offline fallback list of
+# MAGIC region names, used solely when the pricing API cannot be reached.
+# MAGIC
+# MAGIC The recommended SKU is always a size that is **currently on sale, at a published price, in your region** -
+# MAGIC the catalog is built by intersecting the specification feed with the live price list, so the notebook cannot
+# MAGIC recommend something you are unable to buy.
+# MAGIC
 # MAGIC ### How the Azure size is chosen
 # MAGIC
-# MAGIC 1. AWS vCPU and memory come from **this workspace's own node-types API** where possible, otherwise they are
-# MAGIC    derived from the instance name. The `aws_spec_source` column tells you which.
+# MAGIC 1. AWS vCPU and memory come from **this workspace's own node-types API** where possible, otherwise from
+# MAGIC    **AWS's public pricing feed**, otherwise they are derived from the instance name. The `aws_spec_source`
+# MAGIC    column tells you which of the three was used for every row.
 # MAGIC 2. The VM family follows the workload's memory-per-vCPU ratio: &ge;&nbsp;7&nbsp;GB &rarr; memory optimized
 # MAGIC    (E series), &le;&nbsp;2.75&nbsp;GB &rarr; compute optimized (F series), otherwise general purpose (D series).
-# MAGIC    AWS storage-optimized nodes go to the L series so local NVMe is preserved. GPU nodes go to NC/ND VMs.
+# MAGIC    AWS storage-optimized nodes go to the L series so local NVMe is preserved. GPU nodes go to GPU VMs.
 # MAGIC 3. Within that family the notebook picks the **smallest VM that meets or exceeds** the AWS vCPU and memory.
 # MAGIC 4. Node counts carry over unchanged, so the comparison is genuinely like for like.
 # MAGIC 5. `mapping_confidence` flags anything that needs a human look: `high` is a clean capacity match, `medium`
 # MAGIC    fell back to another family, `review` relaxed the memory requirement, `low` found no single VM big enough.
+# MAGIC
+# MAGIC Section 10 prints the exact funnel that produced the candidate list, so you can see how many sizes each rule
+# MAGIC removed and why. If you have an Azure Databricks workspace already, fill in settings **E1** and **E2** and the
+# MAGIC notebook will read the authoritative supported-VM list from it instead of applying that policy.
 # MAGIC
 # MAGIC ### What is **not** included
 # MAGIC
