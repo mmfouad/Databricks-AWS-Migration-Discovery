@@ -2,8 +2,9 @@
 # MAGIC %md
 # MAGIC # AWS Databricks &rarr; Azure Databricks Migration Sizing &amp; Pricing
 # MAGIC
-# MAGIC **What this notebook does.** It looks at the Databricks workloads running in *this* AWS workspace, recommends
-# MAGIC the equivalent **Azure Databricks cluster size**, and prices it using the **public Azure Retail Prices API**.
+# MAGIC **What this notebook does.** It looks at the Databricks workloads running in *this* AWS workspace, reports
+# MAGIC exactly what they consume, recommends the equivalent **Azure Databricks cluster size**, and prices it using
+# MAGIC the **public Azure Retail Prices API**.
 # MAGIC
 # MAGIC **How to run it (3 steps).**
 # MAGIC
@@ -12,16 +13,17 @@
 # MAGIC 3. Pick your **Azure region** in the widget bar. The default is `uaenorth` (UAE North). Everything re-runs
 # MAGIC    from the widgets, so you never have to edit code.
 # MAGIC
-# MAGIC **What you get.**
+# MAGIC **What you get.** The notebook is ordered so that everything you consume is shown **before** anything is
+# MAGIC priced. By the time a cost appears, the inventory it came from is already on screen.
 # MAGIC
-# MAGIC | Section | Output |
+# MAGIC | Part | Output |
 # MAGIC | --- | --- |
 # MAGIC | Quick estimator | A single cluster sized and priced from the widgets. Works with zero permissions. |
-# MAGIC | Workspace sizing | Every discovered AWS cluster, job cluster and SQL warehouse mapped to an Azure VM SKU. |
-# MAGIC | Azure VM pricing | Hourly and monthly Azure VM cost per cluster, in pay-as-you-go, spot, savings plan and reserved terms. |
-# MAGIC | Databricks DBU pricing | AWS DBU spend repriced onto Azure Databricks list prices. |
-# MAGIC | Executive summary | One roll-up table for the business case. |
-# MAGIC | Notes &amp; assumptions | Every assumption written out in plain English. |
+# MAGIC | 1. Discover | Every cluster, job cluster, SQL warehouse, instance pool and node type in the workspace. |
+# MAGIC | 3. Measure | Every VM and DBU consumed today, per workload and per instance type, with node-hours. |
+# MAGIC | 4. Price | Each AWS node mapped to an Azure VM SKU, priced in pay-as-you-go, spot, savings plan and reserved terms. |
+# MAGIC | 4. Price | AWS DBU consumption repriced onto Azure Databricks list prices. |
+# MAGIC | 5. Results | Executive summary, exported tables, and every assumption written out in plain English. |
 # MAGIC
 # MAGIC **Access and security.**
 # MAGIC
@@ -1560,7 +1562,7 @@ display_pdf(spark_conf_pdf, "No Spark configuration returned")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC # Part 2 &mdash; Size the Azure equivalent
+# MAGIC # Part 2 &mdash; Reference data and the sizing engine
 
 # COMMAND ----------
 
@@ -2608,7 +2610,7 @@ print(f"  VM cost per month   : {money(quick_costs['azure_cluster_vm_monthly'])}
 print(f"  Pricing model       : {PRICING_MODEL_LABELS[CONFIG['azure_pricing_model']]}")
 if quick_costs["azure_price_status"] != "priced":
     print("  [warn] No live price was returned. See the pricing warnings table below for the suggested fix.")
-print("  Note: Azure VM cost only. Databricks DBU cost is estimated separately in section 17.")
+print("  Note: Azure VM cost only. Databricks DBU cost is estimated separately in section 18.")
 print("=" * 78)
 
 display_pdf(quick_estimate_pdf, "Quick estimate could not be produced")
@@ -2694,6 +2696,11 @@ if CONFIG["azure_comparison_regions"] and quick_worker_sku:
     display_pdf(region_comparison_pdf, "No region comparison produced")
 else:
     print("No comparison regions selected. Set the 'C4 Compare extra regions' widget to compare, for example: uaecentral,westeurope")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # Part 3 &mdash; Measure what you consume today
 
 # COMMAND ----------
 
@@ -2876,361 +2883,17 @@ display_pdf(historical_clusters_pdf, "No historical cluster definitions availabl
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC # Part 3 &mdash; Price the Azure target
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 15. Recommended Azure sizing and cost for every discovered cluster
+# MAGIC ## 15. What you consume today: Databricks usage and DBUs
 # MAGIC
-# MAGIC Each AWS cluster and job cluster becomes one row: the AWS node type, the recommended Azure VM SKU, the node
-# MAGIC count, total vCPU and memory, and the hourly and monthly VM cost.
+# MAGIC Before any Azure number is calculated, this section shows **what the workspace actually consumes today**.
+# MAGIC `system.billing.usage` records every billable unit the account has produced: DBUs for each compute product,
+# MAGIC by SKU, by cluster, by job and by warehouse.
 # MAGIC
-# MAGIC `hours_source` tells you how the monthly figure was reached:
+# MAGIC Each SKU is priced at its current AWS list rate from `system.billing.list_prices`, so you can see the DBU
+# MAGIC side of the bill as it stands. The Azure comparison comes later, in section 18.
 # MAGIC
-# MAGIC - `measured_node_hours` &mdash; real consumption from `system.compute.node_timeline`. Most accurate.
-# MAGIC - `measured_node_hours_driver_estimated` &mdash; real node-hours, but the runtime did not flag which node
-# MAGIC   was the driver, so driver time was taken as the cluster's active wall-clock hours.
-# MAGIC - `assumed_interactive` / `assumed_job` &mdash; the assumption from the settings cell, because no telemetry
-# MAGIC   was available for that cluster.
-
-# COMMAND ----------
-
-def is_single_node_cluster(config: Dict[str, Any]) -> bool:
-    """A Databricks single-node cluster runs the driver only."""
-    spark_conf = config.get("spark_conf") or {}
-    if spark_conf.get("spark.databricks.cluster.profile") == "singleNode":
-        return True
-    custom_tags = config.get("custom_tags") or {}
-    if str(custom_tags.get("ResourceClass", "")).lower() == "singlenode":
-        return True
-    return to_int(config.get("num_workers")) == 0 and not (config.get("autoscale") or {})
-
-
-def worker_bounds(config: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
-    """Return ``(min_workers, max_workers)``, treating a fixed size as min == max."""
-    autoscale = config.get("autoscale") or {}
-    num_workers = to_int(config.get("num_workers"))
-    min_workers = to_int(autoscale.get("min_workers"))
-    max_workers = to_int(autoscale.get("max_workers"))
-    return (
-        min_workers if min_workers is not None else num_workers,
-        max_workers if max_workers is not None else num_workers,
-    )
-
-
-def monthly_hours_for_cluster(cluster_id: Optional[str], workload_kind: str) -> Tuple[float, float, str]:
-    """Return ``(driver_hours, worker_node_hours, source)`` for one month.
-
-    Measured node-hours win over assumptions. Worker hours are *node*-hours, so they already account
-    for the node count; assumed hours are per node and are scaled by the caller.
-    """
-    telemetry = NODE_HOURS_INDEX.get(str(cluster_id)) if cluster_id else None
-    if telemetry:
-        total_hours = to_float(telemetry.get("monthly_total_node_hours")) or 0.0
-        driver_hours = to_float(telemetry.get("monthly_driver_node_hours")) or 0.0
-        worker_hours = to_float(telemetry.get("monthly_worker_node_hours")) or 0.0
-
-        if driver_hours > 0:
-            return driver_hours, worker_hours, "measured_node_hours"
-
-        if total_hours > 0:
-            # Older runtimes leave the driver flag null, which lands every node in the worker bucket.
-            # A cluster always has exactly one driver, so its hours are the cluster's wall-clock
-            # active hours; the remainder is worker time.
-            driver_hours = min(to_float(telemetry.get("monthly_active_hours")) or 0.0, total_hours)
-            return driver_hours, max(total_hours - driver_hours, 0.0), "measured_node_hours_driver_estimated"
-
-    assumed = {
-        "interactive": CONFIG["assumed_monthly_hours_interactive"],
-        "job": CONFIG["assumed_monthly_hours_job"],
-        "warehouse": CONFIG["assumed_monthly_hours_warehouse"],
-    }.get(workload_kind, CONFIG["assumed_monthly_hours_interactive"])
-    return assumed, assumed, f"assumed_{workload_kind}"
-
-
-def build_sizing_row(
-    config: Dict[str, Any],
-    inventory_source: str,
-    workload_kind: str,
-    item_id: Any,
-    item_name: Any,
-    cluster_id_for_telemetry: Optional[str] = None,
-    extra: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Produce one fully sized and costed migration row from a cluster definition."""
-    min_workers, max_workers = worker_bounds(config)
-    single_node = is_single_node_cluster(config)
-    aws_attributes = config.get("aws_attributes") or {}
-
-    sizing = size_cluster(
-        worker_node_type=config.get("node_type_id"),
-        driver_node_type=config.get("driver_node_type_id"),
-        min_workers=min_workers,
-        max_workers=max_workers,
-        single_node=single_node,
-        forced_sku=CONFIG["azure_vm_sku_override"],
-    )
-
-    driver_hours, worker_node_hours, hours_source = monthly_hours_for_cluster(cluster_id_for_telemetry, workload_kind)
-    worker_count_for_cost = sizing["max_workers"]
-    if hours_source.startswith("assumed"):
-        # Assumed hours are per node, so scale them by the worker count to get worker node-hours.
-        worker_node_hours = worker_node_hours * worker_count_for_cost
-
-    driver_rate = price_book.hourly(sizing["azure_driver_vm_sku"])
-    worker_rate = price_book.hourly(sizing["azure_worker_vm_sku"])
-
-    monthly_cost = None
-    if driver_rate is not None and (worker_count_for_cost == 0 or worker_rate is not None):
-        monthly_cost = driver_rate * driver_hours + (worker_rate or 0.0) * worker_node_hours
-
-    peak_hourly = None
-    if driver_rate is not None and (worker_count_for_cost == 0 or worker_rate is not None):
-        peak_hourly = driver_rate + (worker_rate or 0.0) * worker_count_for_cost
-
-    utilization = NODE_HOURS_INDEX.get(str(cluster_id_for_telemetry)) if cluster_id_for_telemetry else None
-    avg_cpu = to_float((utilization or {}).get("avg_cpu_utilization_percent"))
-    rightsizing_hint = "no_utilization_data"
-    if avg_cpu is not None:
-        if avg_cpu < 15:
-            rightsizing_hint = "review_downsize_cpu_under_15pct"
-        elif avg_cpu > 80:
-            rightsizing_hint = "review_upsize_cpu_over_80pct"
-        else:
-            rightsizing_hint = "utilization_healthy"
-
-    row = {
-        "inventory_source": inventory_source,
-        "workload_kind": workload_kind,
-        "source_cloud": CONFIG["source_cloud"],
-        "target_cloud": CONFIG["target_cloud"],
-        "item_id": item_id,
-        "item_name": item_name,
-        "cluster_id": cluster_id_for_telemetry,
-        **sizing,
-        "spark_version": config.get("spark_version"),
-        "runtime_engine": config.get("runtime_engine"),
-        "policy_id": config.get("policy_id"),
-        "instance_pool_id": config.get("instance_pool_id"),
-        "driver_instance_pool_id": config.get("driver_instance_pool_id"),
-        "autotermination_minutes": config.get("autotermination_minutes"),
-        "aws_availability": aws_attributes.get("availability"),
-        "aws_zone_id": aws_attributes.get("zone_id"),
-        "azure_region": CONFIG["azure_region"],
-        "azure_currency": CONFIG["azure_currency"],
-        "azure_pricing_model": CONFIG["azure_pricing_model"],
-        "azure_driver_vm_hourly": round_or_none(driver_rate, 6),
-        "azure_worker_vm_hourly": round_or_none(worker_rate, 6),
-        "azure_cluster_vm_hourly_at_max": round_or_none(peak_hourly, 4),
-        "monthly_driver_node_hours": round_or_none(driver_hours, 1),
-        "monthly_worker_node_hours": round_or_none(worker_node_hours, 1),
-        "hours_source": hours_source,
-        "azure_vm_monthly_cost": round_or_none(monthly_cost, 2),
-        "avg_cpu_utilization_percent": avg_cpu,
-        "avg_memory_utilization_percent": to_float((utilization or {}).get("avg_memory_utilization_percent")),
-        "rightsizing_hint": rightsizing_hint,
-        "azure_price_status": "priced" if monthly_cost is not None else "no_price_available",
-    }
-    if extra:
-        row.update(extra)
-    return row
-
-
-# Collect every Azure VM SKU the workspace will need, then price them all in one batched pass.
-def collect_required_skus(configs: Iterable[Dict[str, Any]]) -> List[str]:
-    """Pre-compute the distinct Azure VM SKUs needed, so pricing is fetched in as few calls as possible."""
-    skus: set = set()
-    for config in configs:
-        sizing = size_cluster(
-            config.get("node_type_id"), config.get("driver_node_type_id"),
-            *worker_bounds(config), is_single_node_cluster(config), CONFIG["azure_vm_sku_override"],
-        )
-        skus.update(sku for sku in (sizing["azure_worker_vm_sku"], sizing["azure_driver_vm_sku"]) if sku)
-    return sorted(skus)
-
-
-job_cluster_configs = [
-    {
-        "node_type_id": row.get("node_type_id"),
-        "driver_node_type_id": row.get("driver_node_type_id"),
-        "num_workers": row.get("num_workers"),
-        "autoscale": {"min_workers": row.get("autoscale_min_workers"), "max_workers": row.get("autoscale_max_workers")},
-        "spark_version": row.get("spark_version"),
-        "runtime_engine": row.get("runtime_engine"),
-        "policy_id": row.get("policy_id"),
-        "instance_pool_id": row.get("instance_pool_id"),
-        "driver_instance_pool_id": row.get("driver_instance_pool_id"),
-        "_job_id": row.get("job_id"),
-        "_job_name": row.get("job_name"),
-        "_task_key": row.get("task_key"),
-        "_cluster_key": row.get("cluster_key"),
-        "_cluster_scope": row.get("cluster_scope", "job_cluster"),
-    }
-    for row in job_cluster_rows
-]
-
-required_skus = collect_required_skus(list(clusters) + job_cluster_configs)
-if CONFIG["azure_sql_warehouse_node_vm"]:
-    required_skus = sorted(set(required_skus) | {CONFIG["azure_sql_warehouse_node_vm"]})
-
-if required_skus:
-    print(f"Pricing {len(required_skus)} distinct Azure VM SKUs in {CONFIG['azure_region']}...")
-    price_book.fetch(required_skus, CONFIG["azure_region"])
-
-interactive_sizing_rows = [
-    build_sizing_row(
-        cluster,
-        inventory_source="interactive_or_recent_cluster",
-        workload_kind="interactive",
-        item_id=cluster.get("cluster_id"),
-        item_name=cluster.get("cluster_name"),
-        cluster_id_for_telemetry=cluster.get("cluster_id"),
-        extra={
-            "cluster_state": cluster.get("state"),
-            "cluster_source": cluster.get("cluster_source"),
-            "creator_user_name": cluster.get("creator_user_name"),
-        },
-    )
-    for cluster in clusters
-]
-
-job_cluster_sizing_rows = [
-    build_sizing_row(
-        config,
-        inventory_source=config["_cluster_scope"],
-        workload_kind="job",
-        item_id=config["_job_id"],
-        item_name=config["_job_name"],
-        cluster_id_for_telemetry=None,
-        extra={"task_key": config["_task_key"], "cluster_key": config["_cluster_key"]},
-    )
-    for config in job_cluster_configs
-]
-
-cluster_sizing_pdf = pd.DataFrame(interactive_sizing_rows)
-job_cluster_sizing_pdf = pd.DataFrame(job_cluster_sizing_rows)
-combined_compute_sizing_pdf = (
-    pd.concat([cluster_sizing_pdf, job_cluster_sizing_pdf], ignore_index=True)
-    if interactive_sizing_rows or job_cluster_sizing_rows
-    else pd.DataFrame()
-)
-
-HEADLINE_SIZING_COLS = [
-    "inventory_source", "item_name", "aws_worker_node_type", "aws_worker_vcpu", "aws_worker_memory_gb",
-    "azure_worker_vm_sku", "azure_vcpu_per_worker", "azure_memory_gb_per_worker", "max_workers",
-    "max_nodes_including_driver", "azure_total_vcpu_at_max", "azure_total_memory_gb_at_max",
-    "azure_cluster_vm_hourly_at_max", "azure_vm_monthly_cost", "hours_source", "mapping_confidence",
-    "rightsizing_hint", "azure_price_status",
-]
-
-print(f"Sized {len(interactive_sizing_rows)} interactive clusters and {len(job_cluster_sizing_rows)} job clusters.")
-print("Headline view (full detail is in the saved outputs):")
-display_pdf(select_existing(combined_compute_sizing_pdf, HEADLINE_SIZING_COLS), "No compute sizing rows produced")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### SQL warehouse sizing
-# MAGIC
-# MAGIC Databricks SQL warehouse t-shirt sizes map to a fixed number of cluster nodes. **Serverless** warehouses have
-# MAGIC no customer-visible VM cost on Azure, so they are reported with a DBU-only note. Classic and Pro warehouses
-# MAGIC run on VMs in your subscription and are costed here.
-
-# COMMAND ----------
-
-# Databricks SQL warehouse t-shirt size -> nodes per cluster (driver + workers).
-SQL_WAREHOUSE_NODE_COUNTS: Dict[str, int] = {
-    "2X-Small": 1, "X-Small": 2, "Small": 4, "Medium": 8, "Large": 16,
-    "X-Large": 32, "2X-Large": 64, "3X-Large": 128, "4X-Large": 256,
-}
-
-
-def warehouse_node_count(cluster_size: Optional[str]) -> Optional[int]:
-    """Nodes per warehouse cluster for a Databricks SQL t-shirt size."""
-    if not cluster_size:
-        return None
-    normalized = str(cluster_size).strip().lower().replace(" ", "").replace("-", "")
-    for name, nodes in SQL_WAREHOUSE_NODE_COUNTS.items():
-        if name.lower().replace(" ", "").replace("-", "") == normalized:
-            return nodes
-    return None
-
-
-warehouse_sizing_rows: List[Dict[str, Any]] = []
-
-for warehouse in warehouses:
-    warehouse_type = str(warehouse.get("warehouse_type") or "").upper()
-    is_serverless = warehouse_type == "SERVERLESS" or bool(warehouse.get("enable_serverless_compute"))
-    nodes_per_cluster = warehouse_node_count(warehouse.get("cluster_size"))
-    max_clusters = to_int(warehouse.get("max_num_clusters")) or 1
-    total_nodes = (nodes_per_cluster or 0) * max_clusters
-    vm_sku = None if is_serverless else CONFIG["azure_sql_warehouse_node_vm"]
-    node_rate = price_book.hourly(vm_sku) if vm_sku else None
-    monthly_hours = CONFIG["assumed_monthly_hours_warehouse"]
-    vm_spec = AZURE_VM_INDEX.get(vm_sku or "", {})
-
-    warehouse_sizing_rows.append(
-        {
-            "inventory_source": "sql_warehouse",
-            "workload_kind": "warehouse",
-            "source_cloud": CONFIG["source_cloud"],
-            "target_cloud": CONFIG["target_cloud"],
-            "warehouse_id": warehouse.get("id"),
-            "warehouse_name": warehouse.get("name"),
-            "warehouse_type": warehouse.get("warehouse_type"),
-            "is_serverless": is_serverless,
-            "cluster_size": warehouse.get("cluster_size"),
-            "nodes_per_cluster": nodes_per_cluster,
-            "min_num_clusters": warehouse.get("min_num_clusters"),
-            "max_num_clusters": max_clusters,
-            "max_total_nodes": total_nodes or None,
-            "auto_stop_mins": warehouse.get("auto_stop_mins"),
-            "enable_photon": warehouse.get("enable_photon"),
-            "spot_instance_policy": warehouse.get("spot_instance_policy"),
-            "state": warehouse.get("state"),
-            "azure_region": CONFIG["azure_region"],
-            "azure_warehouse_size_equivalent": warehouse.get("cluster_size"),
-            "azure_node_vm_sku": vm_sku,
-            "azure_vcpu_per_node": vm_spec.get("vcpu"),
-            "azure_memory_gb_per_node": vm_spec.get("memory_gb"),
-            "azure_total_vcpu_at_max": (vm_spec.get("vcpu") or 0) * total_nodes or None,
-            "azure_node_vm_hourly": round_or_none(node_rate, 6),
-            "azure_warehouse_vm_hourly_at_max": round_or_none(node_rate * total_nodes, 4) if node_rate and total_nodes else None,
-            "billable_hours_per_month": monthly_hours,
-            "azure_vm_monthly_cost": round_or_none(node_rate * total_nodes * monthly_hours, 2) if node_rate and total_nodes else None,
-            "hours_source": "assumed_warehouse",
-            "azure_currency": CONFIG["azure_currency"],
-            "azure_pricing_model": CONFIG["azure_pricing_model"],
-            "azure_price_status": "not_applicable_serverless" if is_serverless else ("priced" if node_rate else "no_price_available"),
-            "migration_note": (
-                "Serverless SQL warehouses are billed as DBUs only, with no customer-visible VM cost. "
-                "Compare the serverless DBU rate instead."
-                if is_serverless
-                else f"Modelled as {total_nodes or 'n/a'} x {vm_sku}. Validate the warehouse size against query concurrency "
-                     "and latency targets in Azure; Photon and warehouse type also change the DBU rate."
-            ),
-        }
-    )
-
-warehouse_sizing_pdf = pd.DataFrame(warehouse_sizing_rows)
-print(f"Sized {len(warehouse_sizing_rows)} SQL warehouses.")
-display_pdf(warehouse_sizing_pdf, "No SQL warehouse sizing rows produced")
-
-azure_vm_prices_pdf = price_book.to_frame()
-pricing_warnings_pdf = price_book.warnings_frame()
-
-print(f"Azure VM price records retrieved: {len(azure_vm_prices_pdf)}")
-display_pdf(azure_vm_prices_pdf, "No Azure VM prices retrieved")
-display_pdf(pricing_warnings_pdf, "No pricing warnings. Every requested SKU returned a price.")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 16. Databricks usage and DBU pricing
-# MAGIC
-# MAGIC Azure VM cost is only half the bill. This section reads `system.billing.usage` for what you consume today on
-# MAGIC AWS, then reprices the same SKUs against Azure Databricks list prices from `system.billing.list_prices`.
+# MAGIC If system tables are not enabled or readable, every table here is empty and the run continues. Sizing then
+# MAGIC uses the assumed hours from the settings cell.
 
 # COMMAND ----------
 
@@ -3337,14 +3000,730 @@ display_spark_df(job_usage, "No job usage summary available")
 warehouse_usage = safe_sql("warehouse_usage_summary", usage_summary_query(f"get_json_object({usage_metadata_expr}, '$.warehouse_id')", "warehouse_id"))
 display_spark_df(warehouse_usage, "No SQL warehouse usage summary available")
 
+# One row per billing SKU: how much was consumed, and what it costs at the current AWS list rate.
+current_dbu_consumption = safe_sql(
+    "current_dbu_consumption_by_sku",
+    f"""
+    WITH priced AS (
+      SELECT
+        u.sku_name,
+        u.usage_unit,
+        {u_billing_origin_product_expr} AS billing_origin_product,
+        {u_usage_type_expr} AS usage_type,
+        u.usage_quantity,
+        p.currency_code,
+        try_cast(coalesce(get_json_object(to_json(p.pricing), '$.effective_list.default'),
+                          get_json_object(to_json(p.pricing), '$.default')) AS DOUBLE) AS list_unit_price
+      FROM system.billing.usage u
+      LEFT JOIN system.billing.list_prices p
+        ON p.cloud = u.cloud
+       AND p.sku_name = u.sku_name
+       AND p.usage_unit = u.usage_unit
+       AND u.usage_start_time >= p.price_start_time
+       AND (p.price_end_time IS NULL OR u.usage_start_time < p.price_end_time)
+      WHERE u.usage_start_time >= DATE({start_date_sql})
+        AND u.cloud = {source_cloud_sql}
+    )
+    SELECT
+      sku_name,
+      billing_origin_product,
+      usage_type,
+      usage_unit,
+      currency_code,
+      SUM(usage_quantity)                                                     AS usage_in_window,
+      SUM(usage_quantity * list_unit_price)                                   AS list_cost_in_window,
+      MAX(list_unit_price)                                                    AS list_unit_price,
+      SUM(CASE WHEN list_unit_price IS NULL THEN usage_quantity ELSE 0 END)   AS unpriced_quantity
+    FROM priced
+    GROUP BY sku_name, billing_origin_product, usage_type, usage_unit, currency_code
+    ORDER BY usage_in_window DESC
+    """,
+)
+
+dbu_consumption_pdf = spark_to_pdf(current_dbu_consumption)
+
+if not dbu_consumption_pdf.empty:
+    # Scale the lookback window to a calendar month so the figure is comparable with the cost model.
+    window_to_month = DAYS_PER_MONTH / lookback_days if lookback_days else 0.0
+    for source_column, monthly_column in [
+        ("usage_in_window", "usage_per_month"),
+        ("list_cost_in_window", "aws_list_cost_per_month"),
+    ]:
+        if source_column in dbu_consumption_pdf.columns:
+            dbu_consumption_pdf[monthly_column] = (
+                pd.to_numeric(dbu_consumption_pdf[source_column], errors="coerce") * window_to_month
+            ).round(2)
+
+    dbu_units = dbu_consumption_pdf[dbu_consumption_pdf.get("usage_unit", "").astype(str).str.upper() == "DBU"]
+    total_dbus_in_window = pd.to_numeric(dbu_units.get("usage_in_window", pd.Series(dtype=float)), errors="coerce").sum()
+    if total_dbus_in_window:
+        dbu_consumption_pdf["share_of_dbus_percent"] = (
+            pd.to_numeric(dbu_consumption_pdf["usage_in_window"], errors="coerce") / total_dbus_in_window * 100.0
+        ).round(1)
+
+    print(f"Billing SKUs consumed in the last {CONFIG['usage_lookback_days']} days: {len(dbu_consumption_pdf)}")
+
+display_pdf(dbu_consumption_pdf, "No DBU consumption available. Enable system tables to see what you consume today.")
+
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### AWS to Azure Databricks list-price comparison
+# MAGIC ## 16. Consumption inventory: every VM and DBU behind the estimate
+# MAGIC
+# MAGIC This is the evidence layer. Nothing here is an Azure number &mdash; it is a full accounting of the compute
+# MAGIC the workspace runs today, so the pricing in the next section can be checked line by line.
+# MAGIC
+# MAGIC Three views are produced:
+# MAGIC
+# MAGIC 1. **Per workload** &mdash; every cluster, job cluster and SQL warehouse, split into its driver and worker
+# MAGIC    nodes, with the AWS instance type, node count and monthly node-hours behind each one.
+# MAGIC 2. **Per instance type** &mdash; the same data rolled up, so you can see the whole EC2 fleet the workspace
+# MAGIC    consumes and which instance types dominate it.
+# MAGIC 3. **Totals** &mdash; node-hours, vCPU-hours, memory GB-hours and DBUs per month, in one place.
+# MAGIC
+# MAGIC `hours_source` on every row states whether the hours were **measured** from `system.compute.node_timeline`
+# MAGIC or **assumed** from the settings cell. Node counts are stated at maximum autoscale, which is the worst case.
+
+# COMMAND ----------
+
+# Shared workload-shape helpers. Consumption reporting uses them first; the sizing engine
+# in section 17 reuses the same functions, so both views describe the same fleet.
+
+def is_single_node_cluster(config: Dict[str, Any]) -> bool:
+    """A Databricks single-node cluster runs the driver only."""
+    spark_conf = config.get("spark_conf") or {}
+    if spark_conf.get("spark.databricks.cluster.profile") == "singleNode":
+        return True
+    custom_tags = config.get("custom_tags") or {}
+    if str(custom_tags.get("ResourceClass", "")).lower() == "singlenode":
+        return True
+    return to_int(config.get("num_workers")) == 0 and not (config.get("autoscale") or {})
+
+
+def worker_bounds(config: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+    """Return ``(min_workers, max_workers)``, treating a fixed size as min == max."""
+    autoscale = config.get("autoscale") or {}
+    num_workers = to_int(config.get("num_workers"))
+    min_workers = to_int(autoscale.get("min_workers"))
+    max_workers = to_int(autoscale.get("max_workers"))
+    return (
+        min_workers if min_workers is not None else num_workers,
+        max_workers if max_workers is not None else num_workers,
+    )
+
+
+def monthly_hours_for_cluster(cluster_id: Optional[str], workload_kind: str) -> Tuple[float, float, str]:
+    """Return ``(driver_hours, worker_node_hours, source)`` for one month.
+
+    Measured node-hours win over assumptions. Worker hours are *node*-hours, so they already account
+    for the node count; assumed hours are per node and are scaled by the caller.
+    """
+    telemetry = NODE_HOURS_INDEX.get(str(cluster_id)) if cluster_id else None
+    if telemetry:
+        total_hours = to_float(telemetry.get("monthly_total_node_hours")) or 0.0
+        driver_hours = to_float(telemetry.get("monthly_driver_node_hours")) or 0.0
+        worker_hours = to_float(telemetry.get("monthly_worker_node_hours")) or 0.0
+
+        if driver_hours > 0:
+            return driver_hours, worker_hours, "measured_node_hours"
+
+        if total_hours > 0:
+            # Older runtimes leave the driver flag null, which lands every node in the worker bucket.
+            # A cluster always has exactly one driver, so its hours are the cluster's wall-clock
+            # active hours; the remainder is worker time.
+            driver_hours = min(to_float(telemetry.get("monthly_active_hours")) or 0.0, total_hours)
+            return driver_hours, max(total_hours - driver_hours, 0.0), "measured_node_hours_driver_estimated"
+
+    assumed = {
+        "interactive": CONFIG["assumed_monthly_hours_interactive"],
+        "job": CONFIG["assumed_monthly_hours_job"],
+        "warehouse": CONFIG["assumed_monthly_hours_warehouse"],
+    }.get(workload_kind, CONFIG["assumed_monthly_hours_interactive"])
+    return assumed, assumed, f"assumed_{workload_kind}"
+
+# Databricks SQL warehouse t-shirt size -> nodes per cluster (driver + workers).
+SQL_WAREHOUSE_NODE_COUNTS: Dict[str, int] = {
+    "2X-Small": 1, "X-Small": 2, "Small": 4, "Medium": 8, "Large": 16,
+    "X-Large": 32, "2X-Large": 64, "3X-Large": 128, "4X-Large": 256,
+}
+
+
+def warehouse_node_count(cluster_size: Optional[str]) -> Optional[int]:
+    """Nodes per warehouse cluster for a Databricks SQL t-shirt size."""
+    if not cluster_size:
+        return None
+    normalized = str(cluster_size).strip().lower().replace(" ", "").replace("-", "")
+    for name, nodes in SQL_WAREHOUSE_NODE_COUNTS.items():
+        if name.lower().replace(" ", "").replace("-", "") == normalized:
+            return nodes
+    return None
+
+job_cluster_configs = [
+    {
+        "node_type_id": row.get("node_type_id"),
+        "driver_node_type_id": row.get("driver_node_type_id"),
+        "num_workers": row.get("num_workers"),
+        "autoscale": {"min_workers": row.get("autoscale_min_workers"), "max_workers": row.get("autoscale_max_workers")},
+        "spark_version": row.get("spark_version"),
+        "runtime_engine": row.get("runtime_engine"),
+        "policy_id": row.get("policy_id"),
+        "instance_pool_id": row.get("instance_pool_id"),
+        "driver_instance_pool_id": row.get("driver_instance_pool_id"),
+        "_job_id": row.get("job_id"),
+        "_job_name": row.get("job_name"),
+        "_task_key": row.get("task_key"),
+        "_cluster_key": row.get("cluster_key"),
+        "_cluster_scope": row.get("cluster_scope", "job_cluster"),
+    }
+    for row in job_cluster_rows
+]
+
+# COMMAND ----------
+
+def consumption_row(
+    inventory_source: str,
+    workload_kind: str,
+    item_id: Any,
+    item_name: Any,
+    cluster_id: Optional[str],
+    node_role: str,
+    aws_node_type: Optional[str],
+    node_count: int,
+    monthly_node_hours: float,
+    hours_source: str,
+    note: Optional[str] = None,
+    spec_override: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Describe one group of identical nodes: what it is, how many, and for how long each month."""
+    spec = dict(spec_override) if spec_override else resolve_aws_node_spec(aws_node_type)
+    vcpu = to_float(spec.get("vcpu"))
+    memory_gb = to_float(spec.get("memory_gb"))
+    hours = to_float(monthly_node_hours) or 0.0
+
+    return {
+        "inventory_source": inventory_source,
+        "workload_kind": workload_kind,
+        "item_id": item_id,
+        "item_name": item_name,
+        "cluster_id": cluster_id,
+        "node_role": node_role,
+        "aws_node_type": aws_node_type or "unknown",
+        "aws_instance_type": spec.get("instance_type_id"),
+        "aws_node_category": spec.get("category"),
+        "vcpu_per_node": spec.get("vcpu"),
+        "memory_gb_per_node": spec.get("memory_gb"),
+        "local_disk_gb_per_node": spec.get("local_disk_gb"),
+        "gpus_per_node": spec.get("num_gpus"),
+        "node_count_at_max": node_count,
+        "monthly_node_hours": round_or_none(hours, 1),
+        "monthly_vcpu_hours": round_or_none(vcpu * hours, 1) if vcpu else None,
+        "monthly_memory_gb_hours": round_or_none(memory_gb * hours, 1) if memory_gb else None,
+        "hours_source": hours_source,
+        "spec_source": spec.get("spec_source"),
+        "note": note,
+    }
+
+
+def cluster_consumption_rows(
+    config: Dict[str, Any],
+    inventory_source: str,
+    workload_kind: str,
+    item_id: Any,
+    item_name: Any,
+    cluster_id_for_telemetry: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Split one cluster definition into its driver row and, unless single-node, its worker row."""
+    _, max_workers = worker_bounds(config)
+    single_node = is_single_node_cluster(config)
+    worker_count = 0 if single_node else (max_workers or 0)
+
+    worker_node_type = config.get("node_type_id")
+    driver_node_type = config.get("driver_node_type_id") or worker_node_type
+
+    driver_hours, worker_node_hours, hours_source = monthly_hours_for_cluster(cluster_id_for_telemetry, workload_kind)
+    if hours_source.startswith("assumed"):
+        # Assumed hours are per node, so scale them by the worker count to get worker node-hours.
+        worker_node_hours = worker_node_hours * worker_count
+
+    rows = [
+        consumption_row(
+            inventory_source, workload_kind, item_id, item_name, cluster_id_for_telemetry,
+            "driver", driver_node_type, 1, driver_hours, hours_source,
+            note="single-node cluster: the driver runs the workload" if single_node else None,
+        )
+    ]
+    if worker_count > 0:
+        rows.append(
+            consumption_row(
+                inventory_source, workload_kind, item_id, item_name, cluster_id_for_telemetry,
+                "worker", worker_node_type, worker_count, worker_node_hours, hours_source,
+                note="node count is stated at maximum autoscale",
+            )
+        )
+    return rows
+
+
+consumption_rows: List[Dict[str, Any]] = []
+
+for cluster in clusters:
+    consumption_rows.extend(
+        cluster_consumption_rows(
+            cluster, "interactive_or_recent_cluster", "interactive",
+            cluster.get("cluster_id"), cluster.get("cluster_name"), cluster.get("cluster_id"),
+        )
+    )
+
+for config in job_cluster_configs:
+    consumption_rows.extend(
+        cluster_consumption_rows(
+            config, config["_cluster_scope"], "job", config["_job_id"], config["_job_name"], None,
+        )
+    )
+
+for warehouse in warehouses:
+    warehouse_type = str(warehouse.get("warehouse_type") or "").upper()
+    is_serverless = warehouse_type == "SERVERLESS" or bool(warehouse.get("enable_serverless_compute"))
+    nodes_per_cluster = warehouse_node_count(warehouse.get("cluster_size")) or 0
+    total_nodes = nodes_per_cluster * (to_int(warehouse.get("max_num_clusters")) or 1)
+    warehouse_hours = CONFIG["assumed_monthly_hours_warehouse"]
+
+    consumption_rows.append(
+        consumption_row(
+            "sql_warehouse", "warehouse", warehouse.get("id"), warehouse.get("name"), None,
+            "warehouse_node",
+            # Databricks does not expose the instance type behind a SQL warehouse, so it is named
+            # rather than guessed. The node count comes from the documented t-shirt size.
+            "databricks_managed_sql_node",
+            0 if is_serverless else total_nodes,
+            0.0 if is_serverless else warehouse_hours * total_nodes,
+            "not_applicable_serverless" if is_serverless else "assumed_warehouse",
+            note=(
+                f"serverless {warehouse.get('cluster_size')} warehouse: billed as DBUs only, no customer VMs"
+                if is_serverless
+                else f"{warehouse.get('cluster_size')} warehouse, {nodes_per_cluster} nodes per cluster"
+            ),
+            spec_override={
+                "vcpu": None, "memory_gb": None, "category": "sql_warehouse", "has_local_nvme": None,
+                "num_gpus": None, "instance_type_id": None, "local_disk_gb": None,
+                "spec_source": "not_exposed_by_databricks",
+            },
+        )
+    )
+
+consumption_pdf = pd.DataFrame(consumption_rows)
+
+CONSUMPTION_COLS = [
+    "workload_kind", "item_name", "node_role", "aws_node_type", "aws_node_category",
+    "node_count_at_max", "vcpu_per_node", "memory_gb_per_node", "gpus_per_node",
+    "monthly_node_hours", "monthly_vcpu_hours", "hours_source", "note",
+]
+
+print(f"Consumption rows (one per node group): {len(consumption_pdf)}")
+display_pdf(select_existing(consumption_pdf, CONSUMPTION_COLS), "No compute consumption rows produced")
+
+# COMMAND ----------
+
+fleet_consumption_pdf = pd.DataFrame()
+
+if not consumption_pdf.empty:
+    numeric_cols = ["node_count_at_max", "monthly_node_hours", "monthly_vcpu_hours", "monthly_memory_gb_hours"]
+    rollup_source = consumption_pdf.copy()
+    for column in numeric_cols:
+        rollup_source[column] = pd.to_numeric(rollup_source[column], errors="coerce").fillna(0.0)
+
+    fleet_consumption_pdf = (
+        rollup_source.groupby("aws_node_type", dropna=False)
+        .agg(
+            aws_node_category=("aws_node_category", "first"),
+            vcpu_per_node=("vcpu_per_node", "first"),
+            memory_gb_per_node=("memory_gb_per_node", "first"),
+            local_disk_gb_per_node=("local_disk_gb_per_node", "first"),
+            gpus_per_node=("gpus_per_node", "first"),
+            workloads_using_it=("item_name", "nunique"),
+            used_as=("node_role", lambda roles: ", ".join(sorted(set(roles)))),
+            nodes_at_max_scale=("node_count_at_max", "sum"),
+            monthly_node_hours=("monthly_node_hours", "sum"),
+            monthly_vcpu_hours=("monthly_vcpu_hours", "sum"),
+            monthly_memory_gb_hours=("monthly_memory_gb_hours", "sum"),
+            spec_source=("spec_source", "first"),
+        )
+        .reset_index()
+        .sort_values("monthly_node_hours", ascending=False)
+    )
+
+    total_node_hours = float(fleet_consumption_pdf["monthly_node_hours"].sum())
+    if total_node_hours > 0:
+        fleet_consumption_pdf["share_of_node_hours_percent"] = (
+            fleet_consumption_pdf["monthly_node_hours"] / total_node_hours * 100.0
+        ).round(1)
+
+    for column in ["monthly_node_hours", "monthly_vcpu_hours", "monthly_memory_gb_hours"]:
+        fleet_consumption_pdf[column] = fleet_consumption_pdf[column].round(1)
+    fleet_consumption_pdf["nodes_at_max_scale"] = fleet_consumption_pdf["nodes_at_max_scale"].astype(int)
+
+    # A node type with no known spec has unknown vCPU and memory, not zero. Summing NaN gives 0,
+    # which would understate the fleet silently, so those cells are blanked instead.
+    for spec_column, derived_column in [
+        ("vcpu_per_node", "monthly_vcpu_hours"),
+        ("memory_gb_per_node", "monthly_memory_gb_hours"),
+    ]:
+        unknown = fleet_consumption_pdf[spec_column].isna()
+        fleet_consumption_pdf.loc[unknown, derived_column] = None
+
+    unknown_specs = int(fleet_consumption_pdf["vcpu_per_node"].isna().sum())
+    print(f"Distinct AWS instance types consumed by this workspace: {len(fleet_consumption_pdf)}")
+    if unknown_specs:
+        print(
+            f"[warn] {unknown_specs} of them have no published spec, so their vCPU and memory hours are blank. "
+            "They are still sized in section 17 wherever the instance name can be parsed."
+        )
+
+print("Every VM the workspace consumes, largest first:")
+display_pdf(fleet_consumption_pdf, "No VM fleet could be derived. Check the API inventory in section 7.")
+
+# COMMAND ----------
+
+def total_of(pdf: pd.DataFrame, column: str, digits: int = 1) -> Optional[float]:
+    """Sum a column across a frame, returning ``None`` when there is nothing to sum."""
+    if pdf is None or pdf.empty or column not in pdf.columns:
+        return None
+    total = pd.to_numeric(pdf[column], errors="coerce").sum()
+    return None if pd.isna(total) else round(float(total), digits)
+
+
+def describe_hours_source(pdf: pd.DataFrame) -> str:
+    """State plainly whether the node-hours behind the estimate were measured or assumed."""
+    if pdf is None or pdf.empty or "hours_source" not in pdf.columns:
+        return NOT_AVAILABLE
+    sources = pdf["hours_source"].astype(str)
+    measured = int(sources.str.startswith("measured").sum())
+    total = int(len(sources))
+    if measured == total:
+        return f"measured from system.compute.node_timeline ({measured} of {total} node groups)"
+    if measured == 0:
+        return f"assumed from the settings cell (0 of {total} node groups measured)"
+    return f"mixed: {measured} of {total} node groups measured, the rest assumed"
+
+
+dbu_units_pdf = pd.DataFrame()
+if not dbu_consumption_pdf.empty and "usage_unit" in dbu_consumption_pdf.columns:
+    dbu_units_pdf = dbu_consumption_pdf[dbu_consumption_pdf["usage_unit"].astype(str).str.upper() == "DBU"]
+
+top_dbu_sku = NOT_AVAILABLE
+if not dbu_units_pdf.empty and "sku_name" in dbu_units_pdf.columns:
+    top_row = dbu_units_pdf.iloc[0]
+    top_dbu_sku = f"{top_row['sku_name']} ({to_float(top_row.get('share_of_dbus_percent')) or 0:.0f}% of DBUs)"
+
+aws_dbu_currency = NOT_AVAILABLE
+if not dbu_consumption_pdf.empty and "currency_code" in dbu_consumption_pdf.columns:
+    currencies = dbu_consumption_pdf["currency_code"].dropna().unique()
+    if len(currencies):
+        aws_dbu_currency = str(currencies[0])
+
+gpu_nodes = 0
+if not fleet_consumption_pdf.empty and "gpus_per_node" in fleet_consumption_pdf.columns:
+    gpu_rows = fleet_consumption_pdf[pd.to_numeric(fleet_consumption_pdf["gpus_per_node"], errors="coerce").fillna(0) > 0]
+    gpu_nodes = int(pd.to_numeric(gpu_rows.get("nodes_at_max_scale", pd.Series(dtype=float)), errors="coerce").sum())
+
+consumption_totals_pdf = pd.DataFrame(
+    [
+        {"category": "Window", "metric": "Observation window", "value": f"{CONFIG['usage_lookback_days']} days from {start_date}"},
+        {"category": "Window", "metric": "Node-hours source", "value": describe_hours_source(consumption_pdf)},
+        {"category": "VMs", "metric": "Workloads inventoried (clusters, job clusters, warehouses)", "value": len(clusters) + len(job_cluster_configs) + len(warehouses)},
+        {"category": "VMs", "metric": "Distinct AWS instance types consumed", "value": len(fleet_consumption_pdf)},
+        {"category": "VMs", "metric": "Nodes at maximum scale", "value": int(total_of(fleet_consumption_pdf, "nodes_at_max_scale", 0) or 0)},
+        {"category": "VMs", "metric": "GPU nodes at maximum scale", "value": gpu_nodes},
+        {"category": "VMs", "metric": "Node-hours per month", "value": total_of(fleet_consumption_pdf, "monthly_node_hours")},
+        {"category": "VMs", "metric": "vCPU-hours per month", "value": total_of(fleet_consumption_pdf, "monthly_vcpu_hours")},
+        {"category": "VMs", "metric": "Memory GB-hours per month", "value": total_of(fleet_consumption_pdf, "monthly_memory_gb_hours")},
+        {"category": "DBUs", "metric": "Billing SKUs consumed", "value": len(dbu_consumption_pdf) or NOT_AVAILABLE},
+        {"category": "DBUs", "metric": "DBUs consumed in the window", "value": total_of(dbu_units_pdf, "usage_in_window") or NOT_AVAILABLE},
+        {"category": "DBUs", "metric": "DBUs per month", "value": total_of(dbu_units_pdf, "usage_per_month") or NOT_AVAILABLE},
+        {"category": "DBUs", "metric": "Largest DBU consumer", "value": top_dbu_sku},
+        {"category": "DBUs", "metric": "Databricks list cost per month, all billed SKUs", "value": money(total_of(dbu_consumption_pdf, "aws_list_cost_per_month", 2), aws_dbu_currency if aws_dbu_currency != NOT_AVAILABLE else None)},
+    ]
+)
+
+print("=" * 78)
+print("WHAT YOU CONSUME TODAY  (no Azure pricing applied yet)")
+print("=" * 78)
+for row in consumption_totals_pdf.to_dict("records"):
+    print(f"  {row['category']:<8} {row['metric']:<58} {row['value']}")
+print("=" * 78)
+
+display_pdf(consumption_totals_pdf, "No consumption totals could be produced")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # Part 4 &mdash; Price the Azure target
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 17. Recommended Azure sizing and cost for every discovered cluster
+# MAGIC
+# MAGIC Each AWS cluster and job cluster becomes one row: the AWS node type, the recommended Azure VM SKU, the node
+# MAGIC count, total vCPU and memory, and the hourly and monthly VM cost.
+# MAGIC
+# MAGIC `hours_source` tells you how the monthly figure was reached:
+# MAGIC
+# MAGIC - `measured_node_hours` &mdash; real consumption from `system.compute.node_timeline`. Most accurate.
+# MAGIC - `measured_node_hours_driver_estimated` &mdash; real node-hours, but the runtime did not flag which node
+# MAGIC   was the driver, so driver time was taken as the cluster's active wall-clock hours.
+# MAGIC - `assumed_interactive` / `assumed_job` &mdash; the assumption from the settings cell, because no telemetry
+# MAGIC   was available for that cluster.
+
+# COMMAND ----------
+
+def build_sizing_row(
+    config: Dict[str, Any],
+    inventory_source: str,
+    workload_kind: str,
+    item_id: Any,
+    item_name: Any,
+    cluster_id_for_telemetry: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Produce one fully sized and costed migration row from a cluster definition."""
+    min_workers, max_workers = worker_bounds(config)
+    single_node = is_single_node_cluster(config)
+    aws_attributes = config.get("aws_attributes") or {}
+
+    sizing = size_cluster(
+        worker_node_type=config.get("node_type_id"),
+        driver_node_type=config.get("driver_node_type_id"),
+        min_workers=min_workers,
+        max_workers=max_workers,
+        single_node=single_node,
+        forced_sku=CONFIG["azure_vm_sku_override"],
+    )
+
+    driver_hours, worker_node_hours, hours_source = monthly_hours_for_cluster(cluster_id_for_telemetry, workload_kind)
+    worker_count_for_cost = sizing["max_workers"]
+    if hours_source.startswith("assumed"):
+        # Assumed hours are per node, so scale them by the worker count to get worker node-hours.
+        worker_node_hours = worker_node_hours * worker_count_for_cost
+
+    driver_rate = price_book.hourly(sizing["azure_driver_vm_sku"])
+    worker_rate = price_book.hourly(sizing["azure_worker_vm_sku"])
+
+    monthly_cost = None
+    if driver_rate is not None and (worker_count_for_cost == 0 or worker_rate is not None):
+        monthly_cost = driver_rate * driver_hours + (worker_rate or 0.0) * worker_node_hours
+
+    peak_hourly = None
+    if driver_rate is not None and (worker_count_for_cost == 0 or worker_rate is not None):
+        peak_hourly = driver_rate + (worker_rate or 0.0) * worker_count_for_cost
+
+    utilization = NODE_HOURS_INDEX.get(str(cluster_id_for_telemetry)) if cluster_id_for_telemetry else None
+    avg_cpu = to_float((utilization or {}).get("avg_cpu_utilization_percent"))
+    rightsizing_hint = "no_utilization_data"
+    if avg_cpu is not None:
+        if avg_cpu < 15:
+            rightsizing_hint = "review_downsize_cpu_under_15pct"
+        elif avg_cpu > 80:
+            rightsizing_hint = "review_upsize_cpu_over_80pct"
+        else:
+            rightsizing_hint = "utilization_healthy"
+
+    row = {
+        "inventory_source": inventory_source,
+        "workload_kind": workload_kind,
+        "source_cloud": CONFIG["source_cloud"],
+        "target_cloud": CONFIG["target_cloud"],
+        "item_id": item_id,
+        "item_name": item_name,
+        "cluster_id": cluster_id_for_telemetry,
+        **sizing,
+        "spark_version": config.get("spark_version"),
+        "runtime_engine": config.get("runtime_engine"),
+        "policy_id": config.get("policy_id"),
+        "instance_pool_id": config.get("instance_pool_id"),
+        "driver_instance_pool_id": config.get("driver_instance_pool_id"),
+        "autotermination_minutes": config.get("autotermination_minutes"),
+        "aws_availability": aws_attributes.get("availability"),
+        "aws_zone_id": aws_attributes.get("zone_id"),
+        "azure_region": CONFIG["azure_region"],
+        "azure_currency": CONFIG["azure_currency"],
+        "azure_pricing_model": CONFIG["azure_pricing_model"],
+        "azure_driver_vm_hourly": round_or_none(driver_rate, 6),
+        "azure_worker_vm_hourly": round_or_none(worker_rate, 6),
+        "azure_cluster_vm_hourly_at_max": round_or_none(peak_hourly, 4),
+        "monthly_driver_node_hours": round_or_none(driver_hours, 1),
+        "monthly_worker_node_hours": round_or_none(worker_node_hours, 1),
+        "hours_source": hours_source,
+        "azure_vm_monthly_cost": round_or_none(monthly_cost, 2),
+        "avg_cpu_utilization_percent": avg_cpu,
+        "avg_memory_utilization_percent": to_float((utilization or {}).get("avg_memory_utilization_percent")),
+        "rightsizing_hint": rightsizing_hint,
+        "azure_price_status": "priced" if monthly_cost is not None else "no_price_available",
+    }
+    if extra:
+        row.update(extra)
+    return row
+
+
+# Collect every Azure VM SKU the workspace will need, then price them all in one batched pass.
+def collect_required_skus(configs: Iterable[Dict[str, Any]]) -> List[str]:
+    """Pre-compute the distinct Azure VM SKUs needed, so pricing is fetched in as few calls as possible."""
+    skus: set = set()
+    for config in configs:
+        sizing = size_cluster(
+            config.get("node_type_id"), config.get("driver_node_type_id"),
+            *worker_bounds(config), is_single_node_cluster(config), CONFIG["azure_vm_sku_override"],
+        )
+        skus.update(sku for sku in (sizing["azure_worker_vm_sku"], sizing["azure_driver_vm_sku"]) if sku)
+    return sorted(skus)
+
+
+required_skus = collect_required_skus(list(clusters) + job_cluster_configs)
+if CONFIG["azure_sql_warehouse_node_vm"]:
+    required_skus = sorted(set(required_skus) | {CONFIG["azure_sql_warehouse_node_vm"]})
+
+if required_skus:
+    print(f"Pricing {len(required_skus)} distinct Azure VM SKUs in {CONFIG['azure_region']}...")
+    price_book.fetch(required_skus, CONFIG["azure_region"])
+
+interactive_sizing_rows = [
+    build_sizing_row(
+        cluster,
+        inventory_source="interactive_or_recent_cluster",
+        workload_kind="interactive",
+        item_id=cluster.get("cluster_id"),
+        item_name=cluster.get("cluster_name"),
+        cluster_id_for_telemetry=cluster.get("cluster_id"),
+        extra={
+            "cluster_state": cluster.get("state"),
+            "cluster_source": cluster.get("cluster_source"),
+            "creator_user_name": cluster.get("creator_user_name"),
+        },
+    )
+    for cluster in clusters
+]
+
+job_cluster_sizing_rows = [
+    build_sizing_row(
+        config,
+        inventory_source=config["_cluster_scope"],
+        workload_kind="job",
+        item_id=config["_job_id"],
+        item_name=config["_job_name"],
+        cluster_id_for_telemetry=None,
+        extra={"task_key": config["_task_key"], "cluster_key": config["_cluster_key"]},
+    )
+    for config in job_cluster_configs
+]
+
+cluster_sizing_pdf = pd.DataFrame(interactive_sizing_rows)
+job_cluster_sizing_pdf = pd.DataFrame(job_cluster_sizing_rows)
+combined_compute_sizing_pdf = (
+    pd.concat([cluster_sizing_pdf, job_cluster_sizing_pdf], ignore_index=True)
+    if interactive_sizing_rows or job_cluster_sizing_rows
+    else pd.DataFrame()
+)
+
+HEADLINE_SIZING_COLS = [
+    "inventory_source", "item_name", "aws_worker_node_type", "aws_worker_vcpu", "aws_worker_memory_gb",
+    "azure_worker_vm_sku", "azure_vcpu_per_worker", "azure_memory_gb_per_worker", "max_workers",
+    "max_nodes_including_driver", "azure_total_vcpu_at_max", "azure_total_memory_gb_at_max",
+    "azure_cluster_vm_hourly_at_max", "azure_vm_monthly_cost", "hours_source", "mapping_confidence",
+    "rightsizing_hint", "azure_price_status",
+]
+
+print(f"Sized {len(interactive_sizing_rows)} interactive clusters and {len(job_cluster_sizing_rows)} job clusters.")
+print("Headline view (full detail is in the saved outputs):")
+display_pdf(select_existing(combined_compute_sizing_pdf, HEADLINE_SIZING_COLS), "No compute sizing rows produced")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### SQL warehouse sizing
+# MAGIC
+# MAGIC Databricks SQL warehouse t-shirt sizes map to a fixed number of cluster nodes. **Serverless** warehouses have
+# MAGIC no customer-visible VM cost on Azure, so they are reported with a DBU-only note. Classic and Pro warehouses
+# MAGIC run on VMs in your subscription and are costed here.
+
+# COMMAND ----------
+
+warehouse_sizing_rows: List[Dict[str, Any]] = []
+
+for warehouse in warehouses:
+    warehouse_type = str(warehouse.get("warehouse_type") or "").upper()
+    is_serverless = warehouse_type == "SERVERLESS" or bool(warehouse.get("enable_serverless_compute"))
+    nodes_per_cluster = warehouse_node_count(warehouse.get("cluster_size"))
+    max_clusters = to_int(warehouse.get("max_num_clusters")) or 1
+    total_nodes = (nodes_per_cluster or 0) * max_clusters
+    vm_sku = None if is_serverless else CONFIG["azure_sql_warehouse_node_vm"]
+    node_rate = price_book.hourly(vm_sku) if vm_sku else None
+    monthly_hours = CONFIG["assumed_monthly_hours_warehouse"]
+    vm_spec = AZURE_VM_INDEX.get(vm_sku or "", {})
+
+    warehouse_sizing_rows.append(
+        {
+            "inventory_source": "sql_warehouse",
+            "workload_kind": "warehouse",
+            "source_cloud": CONFIG["source_cloud"],
+            "target_cloud": CONFIG["target_cloud"],
+            "warehouse_id": warehouse.get("id"),
+            "warehouse_name": warehouse.get("name"),
+            "warehouse_type": warehouse.get("warehouse_type"),
+            "is_serverless": is_serverless,
+            "cluster_size": warehouse.get("cluster_size"),
+            "nodes_per_cluster": nodes_per_cluster,
+            "min_num_clusters": warehouse.get("min_num_clusters"),
+            "max_num_clusters": max_clusters,
+            "max_total_nodes": total_nodes or None,
+            "auto_stop_mins": warehouse.get("auto_stop_mins"),
+            "enable_photon": warehouse.get("enable_photon"),
+            "spot_instance_policy": warehouse.get("spot_instance_policy"),
+            "state": warehouse.get("state"),
+            "azure_region": CONFIG["azure_region"],
+            "azure_warehouse_size_equivalent": warehouse.get("cluster_size"),
+            "azure_node_vm_sku": vm_sku,
+            "azure_vcpu_per_node": vm_spec.get("vcpu"),
+            "azure_memory_gb_per_node": vm_spec.get("memory_gb"),
+            "azure_total_vcpu_at_max": (vm_spec.get("vcpu") or 0) * total_nodes or None,
+            "azure_node_vm_hourly": round_or_none(node_rate, 6),
+            "azure_warehouse_vm_hourly_at_max": round_or_none(node_rate * total_nodes, 4) if node_rate and total_nodes else None,
+            "billable_hours_per_month": monthly_hours,
+            "azure_vm_monthly_cost": round_or_none(node_rate * total_nodes * monthly_hours, 2) if node_rate and total_nodes else None,
+            "hours_source": "assumed_warehouse",
+            "azure_currency": CONFIG["azure_currency"],
+            "azure_pricing_model": CONFIG["azure_pricing_model"],
+            "azure_price_status": "not_applicable_serverless" if is_serverless else ("priced" if node_rate else "no_price_available"),
+            "migration_note": (
+                "Serverless SQL warehouses are billed as DBUs only, with no customer-visible VM cost. "
+                "Compare the serverless DBU rate instead."
+                if is_serverless
+                else f"Modelled as {total_nodes or 'n/a'} x {vm_sku}. Validate the warehouse size against query concurrency "
+                     "and latency targets in Azure; Photon and warehouse type also change the DBU rate."
+            ),
+        }
+    )
+
+warehouse_sizing_pdf = pd.DataFrame(warehouse_sizing_rows)
+print(f"Sized {len(warehouse_sizing_rows)} SQL warehouses.")
+display_pdf(warehouse_sizing_pdf, "No SQL warehouse sizing rows produced")
+
+azure_vm_prices_pdf = price_book.to_frame()
+pricing_warnings_pdf = price_book.warnings_frame()
+
+print(f"Azure VM price records retrieved: {len(azure_vm_prices_pdf)}")
+display_pdf(azure_vm_prices_pdf, "No Azure VM prices retrieved")
+display_pdf(pricing_warnings_pdf, "No pricing warnings. Every requested SKU returned a price.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 18. Azure Databricks DBU repricing
+# MAGIC
+# MAGIC Azure VM cost is only half the bill. The other half is the Databricks DBU charge.
 # MAGIC
 # MAGIC `system.billing.list_prices` carries the list price for **every** cloud, so the Azure DBU rate can be read
-# MAGIC directly rather than copied from a web page. Rows where `unpriced_usage_record_count > 0` had no matching
-# MAGIC Azure SKU and need a manual look, usually because a SKU name differs between clouds.
+# MAGIC directly rather than copied from a web page. The consumption measured in section 15 is repriced here at the
+# MAGIC Azure rate for the same SKU. Rows where `unpriced_usage_record_count > 0` had no matching Azure SKU and need
+# MAGIC a manual look, usually because a SKU name differs between clouds.
 
 # COMMAND ----------
 
@@ -3439,14 +3818,15 @@ display_pdf(sql_errors_pdf, "No system table errors recorded")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC # Part 4 &mdash; Results
+# MAGIC # Part 5 &mdash; Results
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 17. Executive summary
+# MAGIC ## 19. Executive summary
 # MAGIC
-# MAGIC One table for the business case: what the Azure target looks like and what it costs per month.
+# MAGIC One table for the business case: what the workspace consumes today, what the Azure target looks like, and
+# MAGIC what it costs per month. Every figure traces back to a detailed table earlier in the notebook.
 
 # COMMAND ----------
 
@@ -3478,16 +3858,8 @@ def monthly_dbu_totals(estimate_df) -> Dict[str, Optional[float]]:
 dbu_totals = monthly_dbu_totals(aws_to_azure_dbu_estimate)
 
 
-def sum_column(pdf: pd.DataFrame, column: str) -> Optional[float]:
-    """Sum a numeric column, returning ``None`` when the frame or column is empty."""
-    if pdf is None or pdf.empty or column not in pdf.columns:
-        return None
-    total = pd.to_numeric(pdf[column], errors="coerce").sum()
-    return None if pd.isna(total) else round(float(total), 2)
-
-
-compute_vm_monthly = sum_column(combined_compute_sizing_pdf, "azure_vm_monthly_cost")
-warehouse_vm_monthly = sum_column(warehouse_sizing_pdf, "azure_vm_monthly_cost")
+compute_vm_monthly = total_of(combined_compute_sizing_pdf, "azure_vm_monthly_cost")
+warehouse_vm_monthly = total_of(warehouse_sizing_pdf, "azure_vm_monthly_cost")
 total_vm_monthly = sum(value for value in [compute_vm_monthly, warehouse_vm_monthly] if value is not None) or None
 azure_dbu_monthly = dbu_totals["azure_dbu_monthly"]
 total_azure_monthly = sum(value for value in [total_vm_monthly, azure_dbu_monthly] if value is not None) or None
@@ -3510,10 +3882,15 @@ executive_summary_pdf = pd.DataFrame(
         {"category": "Scope", "metric": "Interactive clusters sized", "value": len(cluster_sizing_pdf)},
         {"category": "Scope", "metric": "Job clusters sized", "value": len(job_cluster_sizing_pdf)},
         {"category": "Scope", "metric": "SQL warehouses sized", "value": len(warehouse_sizing_pdf)},
+        {"category": "Consumed today", "metric": "Distinct AWS instance types consumed", "value": len(fleet_consumption_pdf) or NOT_AVAILABLE},
+        {"category": "Consumed today", "metric": "AWS node-hours per month", "value": total_of(fleet_consumption_pdf, "monthly_node_hours") or NOT_AVAILABLE},
+        {"category": "Consumed today", "metric": "AWS vCPU-hours per month", "value": total_of(fleet_consumption_pdf, "monthly_vcpu_hours") or NOT_AVAILABLE},
+        {"category": "Consumed today", "metric": "DBUs per month", "value": total_of(dbu_units_pdf, "usage_per_month") or NOT_AVAILABLE},
+        {"category": "Consumed today", "metric": "Node-hours source", "value": describe_hours_source(consumption_pdf)},
         {"category": "Target", "metric": "Azure region", "value": f"{CONFIG['azure_region']} ({CONFIG['azure_region_label']})"},
         {"category": "Target", "metric": "Most recommended Azure VM SKUs", "value": top_vm_skus or NOT_AVAILABLE},
-        {"category": "Target", "metric": "Total Azure vCPU at max scale", "value": sum_column(combined_compute_sizing_pdf, "azure_total_vcpu_at_max") or NOT_AVAILABLE},
-        {"category": "Target", "metric": "Total Azure memory at max scale (GB)", "value": sum_column(combined_compute_sizing_pdf, "azure_total_memory_gb_at_max") or NOT_AVAILABLE},
+        {"category": "Target", "metric": "Total Azure vCPU at max scale", "value": total_of(combined_compute_sizing_pdf, "azure_total_vcpu_at_max") or NOT_AVAILABLE},
+        {"category": "Target", "metric": "Total Azure memory at max scale (GB)", "value": total_of(combined_compute_sizing_pdf, "azure_total_memory_gb_at_max") or NOT_AVAILABLE},
         {"category": "Cost", "metric": "Azure VM cost, clusters (monthly)", "value": money(compute_vm_monthly, currency)},
         {"category": "Cost", "metric": "Azure VM cost, SQL warehouses (monthly)", "value": money(warehouse_vm_monthly, currency)},
         {"category": "Cost", "metric": "Azure VM cost, total (monthly)", "value": money(total_vm_monthly, currency)},
@@ -3545,7 +3922,7 @@ display_pdf(executive_summary_pdf, "No executive summary could be produced")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 18. Save the outputs
+# MAGIC ## 20. Save the outputs
 # MAGIC
 # MAGIC Everything is written twice: Delta tables under `OUTPUT_BASE_PATH` and CSV files under `LOCAL_OUTPUT_DIR`,
 # MAGIC so the results can be opened in Excel or joined to a wider estimate.
@@ -3597,6 +3974,10 @@ sizing_outputs = {
     "quick_pricing_options": quick_pricing_options_pdf,
     "azure_region_comparison": region_comparison_pdf,
     "aws_to_azure_mapping_examples": mapping_examples_pdf,
+    "consumption_totals": consumption_totals_pdf,
+    "consumption_by_workload": consumption_pdf,
+    "consumption_by_instance_type": fleet_consumption_pdf,
+    "dbu_consumption_by_sku": dbu_consumption_pdf,
 }
 
 print("Writing API inventory outputs")
@@ -3610,6 +3991,7 @@ spark_outputs = {
     "cluster_usage_summary": cluster_usage,
     "job_usage_summary": job_usage,
     "warehouse_usage_summary": warehouse_usage,
+    "current_dbu_consumption_by_sku": current_dbu_consumption,
     "price_catalog_history_source_and_target": price_catalog_history,
     "current_price_catalog_source_and_target": current_price_catalog,
     "source_to_target_databricks_list_price_estimate": aws_to_azure_dbu_estimate,
@@ -3642,7 +4024,7 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 19. Customer notes and assumptions
+# MAGIC ## 21. Customer notes and assumptions
 # MAGIC
 # MAGIC ### What the numbers are
 # MAGIC
@@ -3655,12 +4037,28 @@ else:
 # MAGIC   scaled from the observation window to an average 30.44-day month, which is more accurate than any
 # MAGIC   assumption.
 # MAGIC
+# MAGIC ### Checking the numbers yourself
+# MAGIC
+# MAGIC Nothing here is a black box. Every cost traces back to consumption you can audit:
+# MAGIC
+# MAGIC | To check&hellip; | Look at&hellip; |
+# MAGIC | --- | --- |
+# MAGIC | Which VMs the estimate is built on | Section 16, `consumption_by_instance_type` |
+# MAGIC | How each cluster contributes | Section 16, `consumption_by_workload` |
+# MAGIC | Whether hours were measured or assumed | The `hours_source` column on every row |
+# MAGIC | What you consume in DBUs today | Section 15, `dbu_consumption_by_sku` |
+# MAGIC | How an AWS node became an Azure SKU | Section 17, the `mapping_reason` column |
+# MAGIC | The exact price used for a SKU | `azure_vm_prices`, with its retrieval timestamp |
+# MAGIC
+# MAGIC Multiply `monthly_node_hours` by the hourly rate for the matching Azure SKU and you will reproduce the
+# MAGIC monthly cost for any row by hand.
+# MAGIC
 # MAGIC ### How the Azure size is chosen
 # MAGIC
 # MAGIC 1. AWS vCPU and memory come from **this workspace's own node-types API** where possible, otherwise they are
 # MAGIC    derived from the instance name. The `aws_spec_source` column tells you which.
 # MAGIC 2. The VM family follows the workload's memory-per-vCPU ratio: &ge;&nbsp;7&nbsp;GB &rarr; memory optimized
-# MAGIC    (E series), &le;&nbsp;2.5&nbsp;GB &rarr; compute optimized (F series), otherwise general purpose (D series).
+# MAGIC    (E series), &le;&nbsp;2.75&nbsp;GB &rarr; compute optimized (F series), otherwise general purpose (D series).
 # MAGIC    AWS storage-optimized nodes go to the L series so local NVMe is preserved. GPU nodes go to NC/ND VMs.
 # MAGIC 3. Within that family the notebook picks the **smallest VM that meets or exceeds** the AWS vCPU and memory.
 # MAGIC 4. Node counts carry over unchanged, so the comparison is genuinely like for like.

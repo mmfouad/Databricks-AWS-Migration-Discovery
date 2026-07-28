@@ -1,11 +1,13 @@
 # AWS → Azure Databricks Migration Sizing & Pricing
 
 A single Databricks notebook that a customer can run **inside their own AWS Databricks workspace** to answer
-two questions:
+three questions:
 
-1. **What Azure Databricks cluster do I need?** — the equivalent Azure VM SKU, node count, vCPU and memory
+1. **What am I actually running today?** — every EC2 instance type the workspace consumes, the node-hours
+   behind each one, and every DBU on the bill, itemised before a single Azure price is applied.
+2. **What Azure Databricks cluster do I need?** — the equivalent Azure VM SKU, node count, vCPU and memory
    for every cluster, job cluster and SQL warehouse in the workspace.
-2. **What will it cost?** — hourly and monthly Azure VM pricing pulled live from the **public Azure Retail
+3. **What will it cost?** — hourly and monthly Azure VM pricing pulled live from the **public Azure Retail
    Prices API**, plus the Databricks DBU cost from the billing system tables.
 
 The default target region is **`uaenorth`** (UAE North). Any other region is one dropdown away.
@@ -25,18 +27,39 @@ sizing still runs against a built-in region list.
 
 ## What you get
 
-| Section | Output |
-| --- | --- |
-| 3 | Every valid Azure region value, printed exactly as the notebook accepts it |
-| 7–9 | Inventory of clusters, SQL warehouses, instance pools, jobs and job clusters |
-| 11 | AWS node type → Azure VM SKU recommendation, with the reason for each mapping |
-| 12–13 | Live Azure VM prices, and a quick estimate you can drive entirely from widgets |
-| 14 | Real node-hours and CPU/memory utilisation from `system.compute.node_timeline` |
-| 15 | Recommended Azure size **and monthly cost** for every discovered cluster and warehouse |
-| 16 | Databricks DBU cost today on AWS, repriced against Azure list prices |
-| 17 | Executive summary: total monthly Azure VM + DBU cost |
-| 18 | Delta tables and CSV exports of everything above |
-| 19 | Customer notes, assumptions and exclusions |
+The notebook is deliberately ordered so that **everything you consume is reported before anything is priced**.
+By the time a cost appears, the VM and DBU inventory it was derived from is already on screen.
+
+| Part | Section | Output |
+| --- | --- | --- |
+| Settings | 3 | Every valid Azure region value, printed exactly as the notebook accepts it |
+| 1 Discover | 7–9 | Inventory of clusters, SQL warehouses, instance pools, jobs and job clusters |
+| 2 Reference | 10–11 | AWS node type → Azure VM SKU recommendation, with the reason for each mapping |
+| 2 Reference | 12–13 | Live Azure VM prices, and a quick estimate you can drive entirely from widgets |
+| 3 Measure | 14 | Real node-hours and CPU/memory utilisation from `system.compute.node_timeline` |
+| 3 Measure | 15 | DBUs consumed today by SKU, priced at the current AWS list rate |
+| 3 Measure | 16 | **Consumption inventory**: every VM and DBU behind the estimate, per workload and per instance type |
+| 4 Price | 17 | Recommended Azure size **and monthly cost** for every discovered cluster and warehouse |
+| 4 Price | 18 | Databricks DBU cost repriced against Azure list prices |
+| 5 Results | 19 | Executive summary: what you consume, what you need, what it costs |
+| 5 Results | 20 | Delta tables and CSV exports of everything above |
+| 5 Results | 21 | Customer notes, assumptions and exclusions |
+
+## Consumption inventory
+
+Section 16 is the evidence layer. It exists so no cost in the notebook has to be taken on trust:
+
+- **Per workload** — every cluster, job cluster and SQL warehouse split into driver and worker nodes, with the
+  AWS instance type, node count at maximum autoscale, and monthly node-hours behind each.
+- **Per instance type** — the same data rolled up into the complete EC2 fleet, largest first, with each type's
+  share of total node-hours, vCPU-hours and memory GB-hours.
+- **DBUs** — consumption by billing SKU with each SKU's share of the total and its cost at the AWS list rate.
+- **Totals** — node-hours, vCPU-hours, memory GB-hours and DBUs per month, in one banner.
+
+Every row carries an `hours_source` column saying whether its hours were **measured** from
+`system.compute.node_timeline` or **assumed** from the settings cell, so the confidence of any figure is
+visible at a glance. Multiply `monthly_node_hours` by the hourly rate in `azure_vm_prices` and you can
+reproduce any monthly cost in the notebook by hand.
 
 ## Azure region selection
 
@@ -171,13 +194,14 @@ Delta tables under `OUTPUT_BASE_PATH` (default `dbfs:/tmp/aws_databricks_migrati
 
 - `api_inventory/` — clusters, warehouses, pools, node types, jobs, job clusters, job tasks, node-hours,
   historical cluster definitions, API errors.
-- `azure_migration_sizing/` — `executive_summary`, `run_settings`, `azure_compute_sizing_from_api`,
-  `azure_interactive_cluster_sizing_from_api`, `azure_job_cluster_sizing_from_api`,
-  `azure_sql_warehouse_sizing_from_api`, `azure_vm_catalog`, `azure_vm_prices`, `azure_pricing_warnings`,
-  `azure_regions_allowed`, `quick_estimate`, `quick_pricing_options`, `azure_region_comparison`,
-  `aws_to_azure_mapping_examples`.
-- `billing_usage_and_pricing/` — usage detail and summaries, price catalogs, and the AWS→Azure Databricks
-  list-price estimate.
+- `azure_migration_sizing/` — `executive_summary`, `run_settings`, `consumption_totals`,
+  `consumption_by_workload`, `consumption_by_instance_type`, `dbu_consumption_by_sku`,
+  `azure_compute_sizing_from_api`, `azure_interactive_cluster_sizing_from_api`,
+  `azure_job_cluster_sizing_from_api`, `azure_sql_warehouse_sizing_from_api`, `azure_vm_catalog`,
+  `azure_vm_prices`, `azure_pricing_warnings`, `azure_regions_allowed`, `quick_estimate`,
+  `quick_pricing_options`, `azure_region_comparison`, `aws_to_azure_mapping_examples`.
+- `billing_usage_and_pricing/` — usage detail and summaries, DBU consumption by SKU, price catalogs, and the
+  AWS→Azure Databricks list-price estimate.
 
 `run_settings` records every setting used and `azure_vm_prices` records the retrieval timestamp, so any run
 can be reproduced and audited.
